@@ -1,6 +1,6 @@
 /**
  * WorkflowSearch — AppPlugin
- * Version 1.0.0
+ * Version 1.0.1
  *
  * Persistent panel-based Workflowy-style search across Thymer collections.
  *
@@ -11,6 +11,8 @@
  *   -#tag           → exclude exact tag; -#parent/ or -#parent/* → exclude parent and parent/… (full namespace)
  *   -term           → name does NOT contain term
  *   A OR B          → union of two groups
+ *   is:completed    → records with at least one completed task
+ *   -is:completed   → records with at least one open (incomplete) task
  *
  * Keyboard:
  *   ↑ ↓             → navigate results
@@ -19,7 +21,7 @@
  *   Cmd/Ctrl+S      → save current search
  */
 
-const WS_VERSION = '1.0.0';
+const WS_VERSION = '1.0.1';
 
 const WS_CSS = `
   .ws-root {
@@ -111,20 +113,40 @@ const WS_CSS = `
   .ws-empty-icon { margin-bottom: 10px; opacity: 0.65; }
   .ws-empty-icon .ti { font-size: 26px; }
   .ws-empty-hint { font-size: 10px; color: rgba(138,126,106,0.5); margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.9; }
-  .ws-result { padding: 6px 12px; cursor: pointer; transition: background 0.08s; border-left: 2px solid transparent; }
+  .ws-result-wrap { border-left: 2px solid transparent; }
+  .ws-result-wrap.ws-selected { background: rgba(124,106,247,0.13); border-left-color: rgba(124,106,247,0.65); }
+  .ws-result-wrap.ws-opened { border-left-color: rgba(76,175,80,0.7); }
+  .ws-result-row { display: flex; align-items: flex-start; gap: 0; min-width: 0; }
+  .ws-result-expand {
+    flex-shrink: 0; align-self: flex-start; margin-top: 2px;
+    background: none; border: none; cursor: pointer; color: #8a7e6a;
+    padding: 2px 4px 2px 8px; border-radius: 4px; line-height: 1; transition: color 0.1s, transform 0.12s;
+  }
+  .ws-result-expand:hover { color: #e8e0d0; background: rgba(255,255,255,0.04); }
+  .ws-result-expand.ws-expanded { transform: rotate(90deg); color: #c4b8ff; }
+  .ws-result-expand.ws-hidden { display: none; }
+  .ws-result-expand .ti { font-size: 14px; }
+  .ws-preview { padding: 0 12px 8px 32px; font-size: 11px; color: #a89a82; line-height: 1.45; }
+  .ws-preview-loading, .ws-preview-empty { padding: 4px 0 2px; color: #8a7e6a; font-style: italic; }
+  .ws-preview-line {
+    padding: 4px 8px; margin: 2px 0; border-radius: 5px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.06); background: rgba(255,255,255,0.03);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ws-preview-line:hover { background: rgba(124,106,247,0.12); border-color: rgba(124,106,247,0.25); color: #e8e0d0; }
+  .ws-result { flex: 1; min-width: 0; padding: 6px 12px 6px 4px; cursor: pointer; transition: background 0.08s; }
   .ws-result:hover { background: rgba(255,255,255,0.04); }
-  .ws-result.ws-selected { background: rgba(124,106,247,0.13); border-left-color: rgba(124,106,247,0.65); }
-  .ws-result.ws-opened { border-left-color: rgba(76,175,80,0.7); }
+  .ws-result-wrap:not(.ws-selected) .ws-result:hover { background: rgba(255,255,255,0.04); }
   .ws-result-main { display: flex; align-items: center; gap: 7px; min-width: 0; }
   .ws-result-icon { color: #8a7e6a; flex-shrink: 0; display: flex; align-items: center; }
   .ws-result-icon .ti { font-size: 12px; }
   .ws-result-icon-dim { opacity: 0.35; }
   .ws-result-name { flex: 1; font-size: 12px; color: #e8e0d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ws-result-col { font-size: 9px; color: #8a7e6a; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 3px; padding: 1px 5px; white-space: nowrap; flex-shrink: 0; }
-  .ws-result.ws-selected .ws-result-col { background: rgba(124,106,247,0.12); border-color: rgba(124,106,247,0.25); color: #c4b8ff; }
+  .ws-result-wrap.ws-selected .ws-result-col { background: rgba(124,106,247,0.12); border-color: rgba(124,106,247,0.25); color: #c4b8ff; }
   .ws-result-tags { display: flex; gap: 4px; margin-top: 2px; margin-left: 19px; flex-wrap: wrap; }
   .ws-tag { font-size: 9px; color: #c4a882; background: rgba(196,168,130,0.09); border-radius: 3px; padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .ws-result.ws-selected .ws-tag { color: #c4b8ff; background: rgba(124,106,247,0.10); }
+  .ws-result-wrap.ws-selected .ws-tag { color: #c4b8ff; background: rgba(124,106,247,0.10); }
   .ws-body-sep { display: flex; align-items: center; gap: 8px; padding: 8px 12px 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a7e6a; }
   .ws-body-sep::before, .ws-body-sep::after { content: ''; flex: 1; height: 1px; background: rgba(255,255,255,0.07); }
   .ws-body-badge { font-size: 9px; color: #c4a882; background: rgba(196,168,130,0.10); border: 1px solid rgba(196,168,130,0.20); border-radius: 3px; padding: 0 4px; margin-left: 4px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
@@ -220,6 +242,131 @@ function wsTagExcludeMatches(qTag, entryTags) {
   return entryTags.includes(qn);
 }
 
+/**
+ * getLineItems() may return only top-level roots OR a flattened list of all nodes. If it is flat,
+ * each node can still appear again under parent.children — walking the array + every children tree
+ * visits duplicates. We only walk from record-root line items (parent_guid null/record) and dedupe by guid.
+ */
+function wsRootLineItems(record, lineItems) {
+  if (!lineItems||!lineItems.length) return [];
+  const rg=record.guid;
+  const roots=lineItems.filter(li=>{
+    try {
+      const p=li.parent_guid;
+      return p==null||p===undefined||p===rg;
+    } catch(e) { return true; }
+  });
+  return roots.length?roots:lineItems;
+}
+
+/**
+ * Depth-first walk from roots. Skips duplicate guids (same node in flat list + subtree).
+ * visitor(li, depth) — depth 0 = direct children of the record.
+ */
+async function wsForEachLineItemDeep(lineItems, visitor, depth, seen) {
+  if (depth===undefined) depth=0;
+  if (seen===undefined) seen=new Set();
+  for (const li of lineItems||[]) {
+    try {
+      if (li.guid&&seen.has(li.guid)) continue;
+      if (li.guid) seen.add(li.guid);
+    } catch(e) {}
+    visitor(li, depth);
+    let ch=null;
+    try { ch=li.children; } catch(e) { ch=null; }
+    if (ch===null||ch===undefined) {
+      try { ch=await li.getChildren(); } catch(e) { ch=[]; }
+    }
+    if (ch&&ch.length) await wsForEachLineItemDeep(ch, visitor, depth+1, seen);
+  }
+}
+
+/**
+ * Completed tasks: SDK may set getTaskStatus() === 'done' when isTaskCompleted() is not true.
+ * Open tasks: keep using isTaskCompleted() === false (matches -is:completed behavior users already see).
+ */
+function wsTaskLineIsDone(li) {
+  if (li.type!=='task') return false;
+  try {
+    if (li.isTaskCompleted()===true) return true;
+    if (li.getTaskStatus()==='done') return true;
+  } catch(e) {}
+  return false;
+}
+
+function wsTaskLineIsOpen(li) {
+  if (li.type!=='task') return false;
+  try {
+    return li.isTaskCompleted()===false;
+  } catch(e) {}
+  return false;
+}
+
+/** Aggregate task completion from all task line items in the tree (type === 'task'). */
+async function wsComputeTaskCompletion(record, lineItems) {
+  const roots=wsRootLineItems(record, lineItems);
+  let hasAnyTask=false, hasOpenTask=false, hasCompletedTask=false;
+  await wsForEachLineItemDeep(roots, (li)=>{
+    try {
+      if (li.type!=='task') return;
+      hasAnyTask=true;
+      if (wsTaskLineIsDone(li)) hasCompletedTask=true;
+      if (wsTaskLineIsOpen(li)) hasOpenTask=true;
+    } catch(e) {}
+  });
+  return { hasAnyTask, hasOpenTask, hasCompletedTask };
+}
+
+/**
+ * Record-level completion filter: is:completed → at least one completed task;
+ * -is:completed → at least one open (incomplete) task. Unknown until body/task index runs → exclude.
+ */
+function wsMatchesCompletionFilter(entry,isCompleted) {
+  if (isCompleted===null||isCompleted===undefined) return true;
+  if (entry.hasOpenTask===undefined) return false;
+  if (isCompleted===true) return entry.hasCompletedTask===true;
+  if (isCompleted===false) return entry.hasOpenTask===true;
+  return true;
+}
+
+/** First explicit is:completed / -is:completed in the query (OR: first group that sets it). */
+function wsCompletionPreviewFilter(parsed) {
+  if (!parsed) return null;
+  if (parsed.type==='or') {
+    for (const g of parsed.groups) {
+      if (g.isCompleted!==null&&g.isCompleted!==undefined) return g.isCompleted;
+    }
+    return null;
+  }
+  if (parsed.isCompleted!==null&&parsed.isCompleted!==undefined) return parsed.isCompleted;
+  return null;
+}
+
+function wsTextFromLineItem(li) {
+  try {
+    return (li.segments||[])
+      .filter(s=>['text','bold','italic','code','hashtag'].includes(s.type))
+      .map(s=>typeof s.text==='string'?s.text:'')
+      .join('')
+      .trim();
+  } catch(e) { return ''; }
+}
+
+/** Task lines whose completion matches the query intent (true=done only, false=open only). Returns { li, depth }. */
+async function wsFilterTaskLinesForPreview(record, lineItems, wantCompleted) {
+  if (wantCompleted!==true&&wantCompleted!==false) return [];
+  const roots=wsRootLineItems(record, lineItems);
+  const out=[];
+  await wsForEachLineItemDeep(roots, (li, depth)=>{
+    try {
+      if (li.type!=='task') return;
+      const match=wantCompleted===true?wsTaskLineIsDone(li):wsTaskLineIsOpen(li);
+      if (match) out.push({ li, depth });
+    } catch(e) {}
+  });
+  return out;
+}
+
 // ─── Query Parser ─────────────────────────────────────────────────────────────
 
 class QueryParser {
@@ -239,8 +386,10 @@ class QueryParser {
     let s = raw;
     const includeTags=[],excludeTags=[],phrases=[],excludeTerms=[];
     let isCompleted=null;
-    if (/\bis:completed\b/.test(s))  { isCompleted=true;  s=s.replace(/\bis:completed\b/g,' '); }
+    // Strip -is:completed before is:completed — otherwise \bis:completed\b matches inside "-is:completed",
+    // sets isCompleted=true, and the negative form never runs.
     if (/\-is:completed\b/.test(s))  { isCompleted=false; s=s.replace(/-is:completed\b/g,' '); }
+    if (/\bis:completed\b/.test(s))  { isCompleted=true;  s=s.replace(/\bis:completed\b/g,' '); }
     for (const m of [...s.matchAll(/"([^"]+)"/g)]) phrases.push(m[1].toLowerCase());
     s=s.replace(/"[^"]+"/g,' ');
     for (const m of [...s.matchAll(/-#([^\s#]+)/g)]) excludeTags.push(wsNormalizeTagToken(m[1]));
@@ -317,15 +466,16 @@ class SearchIndex {
     return this._filterGroup(parsed,limit);
   }
   _filterGroup(group,limit) {
-    const {includeTags,excludeTags,phrases,excludeTerms,terms}=group; const out=[];
+    const {includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted=null}=group; const out=[];
     for (const entry of this._entries.values()) {
-      if (this._matches(entry,includeTags,excludeTags,phrases,excludeTerms,terms)) { out.push(entry); if(out.length>=limit) break; }
+      if (this._matches(entry,includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted)) { out.push(entry); if(out.length>=limit) break; }
     }
     return out;
   }
-  _matches(entry,includeTags,excludeTags,phrases,excludeTerms,terms) {
+  _matches(entry,includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted) {
     if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) return false;
     if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) return false;
+    if (!wsMatchesCompletionFilter(entry,isCompleted)) return false;
     const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
     const combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
     if (phrases.length&&!phrases.every(p=>combined.includes(p))) return false;
@@ -340,21 +490,31 @@ class SearchIndex {
     if (entry) entry.bodyLower=String(bodyText||'').toLowerCase();
   }
 
+  /** Task completion flags from line items — same pass as body text in _buildBodyIndex. */
+  updateTaskCompletion(guid,stats) {
+    const entry=this._entries.get(guid);
+    if (!entry) return;
+    entry.hasAnyTask=stats.hasAnyTask;
+    entry.hasOpenTask=stats.hasOpenTask;
+    entry.hasCompletedTask=stats.hasCompletedTask;
+  }
+
   /**
-   * Include/exclude hashtag rules for the parsed query (handles OR groups).
+   * Tag + completion rules for the parsed query (handles OR groups).
    * Used when merging async searchByQuery hits, which only receive plain terms/phrases.
    */
-  matchesParsedTagFilters(entry,parsed) {
+  matchesParsedEntryFilters(entry,parsed) {
     if (!parsed) return true;
     if (parsed.type==='or') {
-      return parsed.groups.some(g=>this._tagGroupMatches(entry,g));
+      return parsed.groups.some(g=>this._entryMatchesGroup(entry,g));
     }
-    return this._tagGroupMatches(entry,parsed);
+    return this._entryMatchesGroup(entry,parsed);
   }
-  _tagGroupMatches(entry,group) {
+  _entryMatchesGroup(entry,group) {
     const includeTags=group.includeTags||[], excludeTags=group.excludeTags||[];
     if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) return false;
     if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) return false;
+    if (!wsMatchesCompletionFilter(entry,group.isCompleted)) return false;
     return true;
   }
 
@@ -379,11 +539,12 @@ class SearchIndex {
   }
 
   _filterGroupWithBody(group,limit) {
-    const {includeTags,excludeTags,phrases,excludeTerms,terms}=group;
+    const {includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted=null}=group;
     const nameMatches=[],bodyMatches=[];
     for (const entry of this._entries.values()) {
       if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) continue;
       if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) continue;
+      if (!wsMatchesCompletionFilter(entry,isCompleted)) continue;
       const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
       const combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
       if (excludeTerms.some(t=>combined.includes(t))) continue;
@@ -417,6 +578,7 @@ class SearchPanel {
     this._nameResults=[]; this._bodyResults=[]; this._allResults=[];
     this._selectedIdx=-1; this._openedGuid=null;
     this._query=''; this._debounce=null; this._searchToken=0;
+    this._expandedGuid=null; this._previewLoadToken=0;
     this._configMode=false; this._saveMode=false; this._root=null;
   }
 
@@ -530,9 +692,9 @@ class SearchPanel {
     this._highlightSelected(); this._scrollToSelected();
   }
   _highlightSelected() {
-    this._root?.querySelectorAll('.ws-result').forEach((row,i)=>row.classList.toggle('ws-selected',i===this._selectedIdx));
+    this._root?.querySelectorAll('.ws-result-wrap').forEach((wrap,i)=>wrap.classList.toggle('ws-selected',i===this._selectedIdx));
   }
-  _scrollToSelected() { this._root?.querySelector('.ws-result.ws-selected')?.scrollIntoView({block:'nearest'}); }
+  _scrollToSelected() { this._root?.querySelector('.ws-result-wrap.ws-selected')?.scrollIntoView({block:'nearest'}); }
   _openSelected() {
     if (this._selectedIdx<0||!this._allResults[this._selectedIdx]) return;
     this._navigateToRecord(this._allResults[this._selectedIdx]);
@@ -598,16 +760,82 @@ class SearchPanel {
     }
   }
 
+  /** Open the record and scroll to a specific line (e.g. from task preview). */
+  async _navigateToRecordLine(entry,itemGuid) {
+    this._openedGuid=entry.record.guid;
+    this._highlightOpened();
+    const myId=this._panel.getId();
+    const allPanels=this._plugin.ui.getPanels()||[];
+    const candidates=allPanels.filter(p=>p.getId()!==myId&&!p.isSidebar());
+    const target=candidates.find(p=>p.isActive())||candidates[0]||null;
+
+    const doNav=async(panel)=>{
+      panel.navigateTo({ type:'edit_panel', rootId:entry.record.guid, workspaceGuid:this._plugin.getWorkspaceGuid() });
+      this._plugin.ui.setActivePanel(panel);
+      try {
+        await new Promise(r=>setTimeout(r,350));
+        await panel.navigateTo({ itemGuid, highlight:true });
+      } catch(e) {
+        console.warn('[WorkflowSearch] line navigate failed:', e);
+      }
+    };
+
+    if (target) { await doNav(target); }
+    else {
+      const newPanel=await this._plugin.ui.createPanel({afterPanel:this._panel});
+      if (newPanel) await doNav(newPanel);
+    }
+  }
+
+  _toggleExpand(entry) {
+    if (this._expandedGuid===entry.guid) this._expandedGuid=null;
+    else this._expandedGuid=entry.guid;
+    this._renderResults();
+  }
+
+  async _loadPreviewFor(entry,wantCompleted,previewEl) {
+    const tk=++this._previewLoadToken;
+    previewEl.innerHTML=`<div class="ws-preview-loading">Loading…</div>`;
+    if (wantCompleted!==true&&wantCompleted!==false) {
+      previewEl.innerHTML='';
+      return;
+    }
+    try {
+      const items=await entry.record.getLineItems(false);
+      if (tk!==this._previewLoadToken) return;
+      const filtered=await wsFilterTaskLinesForPreview(entry.record, items, wantCompleted);
+      previewEl.innerHTML='';
+      if (!filtered.length) {
+        previewEl.innerHTML='<div class="ws-preview-empty">No matching tasks</div>';
+        return;
+      }
+      for (const { li, depth } of filtered) {
+        const div=document.createElement('div');
+        div.className='ws-preview-line';
+        div.style.paddingLeft=(10+Math.min(depth,12)*14)+'px';
+        div.textContent=wsTextFromLineItem(li).slice(0,200)||'(empty task)';
+        const ig=li.guid;
+        div.addEventListener('click',(e)=>{ e.stopPropagation(); this._navigateToRecordLine(entry,ig); });
+        previewEl.appendChild(div);
+      }
+    } catch(e) {
+      if (tk!==this._previewLoadToken) return;
+      previewEl.innerHTML='<div class="ws-preview-empty">Could not load preview</div>';
+    }
+  }
+
   _highlightOpened() {
-    this._root?.querySelectorAll('.ws-result').forEach(row=>{
-      const entry=this._allResults[parseInt(row.dataset.idx,10)];
-      row.classList.toggle('ws-opened',!!(entry&&entry.guid===this._openedGuid));
+    this._root?.querySelectorAll('.ws-result-wrap').forEach(wrap=>{
+      const entry=this._allResults[parseInt(wrap.dataset.idx,10)];
+      wrap.classList.toggle('ws-opened',!!(entry&&entry.guid===this._openedGuid));
     });
   }
 
   _search(query) {
     if (this._configMode) return;
     this._query=query;
+    this._expandedGuid=null;
+    this._previewLoadToken++;
     const token=++this._searchToken;
     const parsed=this._parser.parse(query);
     if (!parsed) {
@@ -647,7 +875,7 @@ class SearchPanel {
       // Only include records present in our index — records absent from the index
       // belong to excluded collections and must not appear in results.
       const indexed=this._index._entries.get(record.guid);
-      if (indexed&&this._index.matchesParsedTagFilters(indexed,parsed)) bodyEntries.push({...indexed,_bodyMatch:true});
+      if (indexed&&this._index.matchesParsedEntryFilters(indexed,parsed)) bodyEntries.push({...indexed,_bodyMatch:true});
     };
     for (const r of (result.records||[])) processRecord(r);
     for (const line of (result.lines||[])) { try { processRecord(line.record); } catch(e) {} }
@@ -663,7 +891,7 @@ class SearchPanel {
     if (!body||this._configMode) return;
     const count=this._index.size();
     if (count>0) {
-      body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag/path &nbsp; #parent/ &nbsp; #parent/* &nbsp; -#… &nbsp; "phrase" &nbsp; -term<br>term1 term2 &nbsp; A OR B</div></div>`;
+      body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag/path &nbsp; #parent/ &nbsp; #parent/* &nbsp; -#… &nbsp; "phrase" &nbsp; -term<br>is:completed &nbsp; -is:completed &nbsp; term1 term2 &nbsp; A OR B</div></div>`;
     } else {
       body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('loader')}</div><div>Building index…</div></div>`;
     }
@@ -676,14 +904,34 @@ class SearchPanel {
       body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search-off')}</div><div>No results</div></div>`;
       return;
     }
+    const parsed=this._parser.parse(this._query);
+    const wantPreview=wsCompletionPreviewFilter(parsed);
+    const showExpand=wantPreview!==null;
     const frag=document.createDocumentFragment();
     let rowIdx=0;
     const buildRow=(entry)=>{
       const idx=rowIdx++;
+      const wrap=document.createElement('div');
+      wrap.className='ws-result-wrap';
+      if (idx===this._selectedIdx) wrap.classList.add('ws-selected');
+      if (entry.guid===this._openedGuid) wrap.classList.add('ws-opened');
+      wrap.dataset.idx=String(idx);
+
+      const rowRow=document.createElement('div');
+      rowRow.className='ws-result-row';
+
+      const expandBtn=document.createElement('button');
+      expandBtn.type='button';
+      expandBtn.className='ws-result-expand'+(showExpand?'':' ws-hidden');
+      expandBtn.title='Preview matching tasks';
+      expandBtn.innerHTML=wsIcon('chevron-right');
+      if (showExpand) {
+        expandBtn.classList.toggle('ws-expanded',this._expandedGuid===entry.guid);
+        expandBtn.addEventListener('click',(e)=>{ e.stopPropagation(); this._toggleExpand(entry); });
+      }
+
       const row=document.createElement('div');
-      const isSelected=idx===this._selectedIdx, isOpened=entry.guid===this._openedGuid;
-      row.className='ws-result'+(isSelected?' ws-selected':'')+(isOpened?' ws-opened':'');
-      row.dataset.idx=String(idx);
+      row.className='ws-result';
       let iconHtml;
       try {
         const rawIcon=entry.record.getIcon(false);
@@ -694,7 +942,22 @@ class SearchPanel {
       row.innerHTML=`<div class="ws-result-main">${iconHtml}<span class="ws-result-name">${wsEsc(entry.displayName)}${bodyBadge}</span><span class="ws-result-col">${wsEsc(entry.collectionName)}</span></div>${tagHtml}`;
       row.addEventListener('click',()=>{ this._selectedIdx=idx; this._highlightSelected(); this._navigateToRecord(entry); });
       row.addEventListener('mouseenter',()=>{ this._selectedIdx=idx; this._highlightSelected(); });
-      return row;
+
+      rowRow.appendChild(expandBtn);
+      rowRow.appendChild(row);
+
+      const preview=document.createElement('div');
+      preview.className='ws-preview';
+      if (showExpand&&this._expandedGuid===entry.guid) {
+        preview.style.display='block';
+        void this._loadPreviewFor(entry,wantPreview,preview);
+      } else {
+        preview.style.display='none';
+      }
+
+      wrap.appendChild(rowRow);
+      wrap.appendChild(preview);
+      return wrap;
     };
     for (const entry of this._nameResults) frag.appendChild(buildRow(entry));
     if (this._bodyResults.length) {
@@ -849,15 +1112,20 @@ class Plugin extends AppPlugin {
       this.events.on('record.updated',(ev)=>{
         if (!this._includedGuids.has(ev.collectionGuid)) return;
         if (ev.trashed===true) { this._index.remove(ev.recordGuid); return; }
-        const record=this.data.getRecord(ev.recordGuid); if(record) this._index.upsert(record,ev.collectionGuid);
+        const record=this.data.getRecord(ev.recordGuid);
+        if (record) { this._index.upsert(record,ev.collectionGuid); void this._refreshTaskStatsForRecord(record); }
       },{collection:'*'}),
       this.events.on('record.created',(ev)=>{
         if (!this._includedGuids.has(ev.collectionGuid)) return;
-        const record=this.data.getRecord(ev.recordGuid); if(record) this._index.upsert(record,ev.collectionGuid);
+        const record=this.data.getRecord(ev.recordGuid);
+        if (record) { this._index.upsert(record,ev.collectionGuid); void this._refreshTaskStatsForRecord(record); }
       },{collection:'*'}),
       this.events.on('record.moved',(ev)=>{
         this._index.remove(ev.recordGuid);
-        if (this._includedGuids.has(ev.collectionGuid)) { const record=this.data.getRecord(ev.recordGuid); if(record) this._index.upsert(record,ev.collectionGuid); }
+        if (this._includedGuids.has(ev.collectionGuid)) {
+          const record=this.data.getRecord(ev.recordGuid);
+          if (record) { this._index.upsert(record,ev.collectionGuid); void this._refreshTaskStatsForRecord(record); }
+        }
       }),
       this.events.on('panel.closed',(ev)=>{ if(ev.panel.getId()===this._searchPanelId) this._searchPanelId=null; }),
       this.events.on('reload',async()=>{ await this._buildIndex(); })
@@ -916,6 +1184,20 @@ class Plugin extends AppPlugin {
    * batches, writes bodyLower onto each entry. Runs after the fast index build.
    * Yields between batches so it never blocks the UI thread.
    */
+  async _refreshTaskStatsForRecord(record) {
+    try {
+      const items=await record.getLineItems(false);
+      const stats=await wsComputeTaskCompletion(record, items);
+      this._index.updateTaskCompletion(record.guid,stats);
+      if (this._searchPanelId) {
+        const panels=this.ui.getPanels()||[];
+        const sp=panels.find(p=>p.getId()===this._searchPanelId);
+        const input=sp?.getElement()?.querySelector('.ws-input');
+        if (input?.value) input.dispatchEvent(new Event('input'));
+      }
+    } catch(e) {}
+  }
+
   async _buildBodyIndex() {
     const entries=[...this._index._entries.values()];
     const BATCH=15, MAX_CHARS=8000;
@@ -930,6 +1212,8 @@ class Plugin extends AppPlugin {
         try {
           const items=await entry.record.getLineItems(false);
           this._index.updateBodyText(entry.guid,extractText(items));
+          const stats=await wsComputeTaskCompletion(entry.record, items);
+          this._index.updateTaskCompletion(entry.guid,stats);
         } catch(e) {}
       }));
       // Yield between batches — keeps UI responsive

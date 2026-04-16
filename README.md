@@ -1,6 +1,6 @@
 # WorkflowSearch
 
-**Version 1.0.0**
+**Version 1.0.1**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
@@ -18,7 +18,8 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **Path tags** (`#self/work`) and **prefix** include (`#self/`, `#self/*`) for a namespace (`self` or `self/…`).
 - **Exclude tags** with different rules for plain (`-#self`), path (`-#self/foo`), and prefix (`-#self/`, `-#self/*`).
 - **Title + body** matching for non-tag query parts (phrase, terms, `-term`); body text is filled in **after** a first-pass index, then the current query is re-run.
-- **Async** `searchByQuery` for plain terms/phrases when needed; merges respect the same hashtag filters as the index.
+- **Async** `searchByQuery` for plain terms/phrases when needed; merges respect the same hashtag and completion filters as the index.
+- **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
 - **Settings** (gear): limit which collections are indexed, and set the **Hashtag property name**.
 
@@ -55,9 +56,16 @@ Whitespace separates tokens. Matching is **case-insensitive** for text and tags.
 
 `A OR B` splits the query into two groups; each side is parsed as its own segment. Results are merged (union), respecting the same limits.
 
-### Other (parsed, not enforced in matching)
+### Task completion
 
-`is:completed` and `-is:completed` are stripped from the query string for parsing but **completion state is not applied** in the current index filters.
+| Pattern | Meaning |
+|--------|---------|
+| `is:completed` | Include records that have **at least one completed** task line (`PluginLineItem` type `task`). Completion is detected via `isTaskCompleted()` or `getTaskStatus() === 'done'`. |
+| `-is:completed` | Include records that have **at least one open** (incomplete) task line. |
+
+Completion is derived from the full document tree (nested tasks under lists/blocks are included). `-is:completed` is parsed **before** `is:completed` so the negative form is not mistaken for the positive one.
+
+When the query uses either form, the result row can be **expanded** (chevron) to load a **preview** of matching task lines only, with indentation by nesting depth.
 
 ## Keyboard
 
