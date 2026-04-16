@@ -1,6 +1,6 @@
 # WorkflowSearch
 
-**Version 1.0.1**
+**Version 1.0.2**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
@@ -80,6 +80,17 @@ When the query uses either form, the result row can be **expanded** (chevron) to
 
 - **Name matches** first, then a **Body matches** section when hits rely on body (or cross-field) text.
 - Rows can show **tags** (up to five) and a **body** badge when the hit is primarily from body text.
+- **Order (v1.0.2+):** Within each section, results are grouped by **collection** (collections stay in **first-seen** order). **Titles are sorted A–Z** within each collection (case-insensitive, locale-aware).
+
+## Changelog
+
+### 1.0.2
+
+- **Search result ordering:** Name matches and body matches are each sorted so that, within every collection, records appear in **alphabetical order by title** (`displayName`). Collection blocks keep the order in which each collection first appeared in the result set.
+
+### 1.0.1
+
+- Task completion filters **`is:completed`** / **`-is:completed`** with indexing from line items; **expand** row preview for matching tasks (nested tree, deduped); parser fix so **`-is:completed`** is not parsed as **`is:completed`**; completed tasks also respect **`getTaskStatus() === 'done'`** when **`isTaskCompleted()`** is not set.
 
 ## Configuration
 

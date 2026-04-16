@@ -1,6 +1,6 @@
 /**
  * WorkflowSearch — AppPlugin
- * Version 1.0.1
+ * Version 1.0.2
  *
  * Persistent panel-based Workflowy-style search across Thymer collections.
  *
@@ -21,7 +21,7 @@
  *   Cmd/Ctrl+S      → save current search
  */
 
-const WS_VERSION = '1.0.1';
+const WS_VERSION = '1.0.2';
 
 const WS_CSS = `
   .ws-root {
@@ -340,6 +340,33 @@ function wsCompletionPreviewFilter(parsed) {
   }
   if (parsed.isCompleted!==null&&parsed.isCompleted!==undefined) return parsed.isCompleted;
   return null;
+}
+
+/**
+ * Search result ordering: keep first-seen collection order, sort record titles A–Z within each collection.
+ */
+function wsSortSearchResultsByCollectionTitle(entries) {
+  if (!entries||!entries.length) return [];
+  const buckets=new Map();
+  const colOrder=[];
+  const seen=new Set();
+  for (const e of entries) {
+    const g=e.collectionGuid||'';
+    if (!buckets.has(g)) buckets.set(g,[]);
+    buckets.get(g).push(e);
+    if (!seen.has(g)) { seen.add(g); colOrder.push(g); }
+  }
+  const out=[];
+  for (const g of colOrder) {
+    const list=buckets.get(g);
+    list.sort((a,b)=>{
+      const na=String(a.displayName||a.name||'').toLowerCase();
+      const nb=String(b.displayName||b.name||'').toLowerCase();
+      return na.localeCompare(nb, undefined, { sensitivity: 'base' });
+    });
+    out.push(...list);
+  }
+  return out;
 }
 
 function wsTextFromLineItem(li) {
@@ -844,9 +871,9 @@ class SearchPanel {
     }
     // Synchronous: name/tag matches + body matches already in the index
     const {nameMatches,bodyMatches}=this._index.queryWithBody(parsed);
-    this._nameResults=nameMatches;
-    this._bodyResults=bodyMatches;
-    this._allResults=[...nameMatches,...bodyMatches];
+    this._nameResults=wsSortSearchResultsByCollectionTitle(nameMatches);
+    this._bodyResults=wsSortSearchResultsByCollectionTitle(bodyMatches);
+    this._allResults=[...this._nameResults,...this._bodyResults];
     this._selectedIdx=this._allResults.length>0?0:-1;
     this._renderResults(); this._updateFooter(this._allResults.length);
     // Async fallback: searchByQuery for body text not yet indexed
@@ -880,7 +907,7 @@ class SearchPanel {
     for (const r of (result.records||[])) processRecord(r);
     for (const line of (result.lines||[])) { try { processRecord(line.record); } catch(e) {} }
     if (!bodyEntries.length) return;
-    this._bodyResults=bodyEntries;
+    this._bodyResults=wsSortSearchResultsByCollectionTitle(bodyEntries);
     this._allResults=[...this._nameResults,...this._bodyResults];
     if (this._selectedIdx<0&&this._allResults.length>0) this._selectedIdx=0;
     this._renderResults(); this._updateFooter(this._allResults.length);
