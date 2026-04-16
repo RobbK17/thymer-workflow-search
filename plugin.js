@@ -1,6 +1,6 @@
 /**
  * WorkflowSearch — AppPlugin
- * Version 1.0.2
+ * Version 1.0.3
  *
  * Persistent panel-based Workflowy-style search across Thymer collections.
  *
@@ -17,11 +17,11 @@
  * Keyboard:
  *   ↑ ↓             → navigate results
  *   Enter           → open selected record in adjacent panel
- *   Cmd/Ctrl+Shift+S → open/focus search panel
- *   Cmd/Ctrl+S      → save current search
+ *   ⌘⇧S / Ctrl+Shift+S → open/focus search panel (macOS uses Command+Shift+S)
+ *   ⌘S / Ctrl+S     → save current search
  */
 
-const WS_VERSION = '1.0.2';
+const WS_VERSION = '1.0.3';
 
 const WS_CSS = `
   .ws-root {
@@ -1128,9 +1128,12 @@ class Plugin extends AppPlugin {
     });
 
     this._cmd=this.ui.addCommandPaletteCommand({ label:'WorkflowSearch: Open search panel', icon:'search', onSelected:()=>this._openPanel() });
-    this._sidebarItem=this.ui.addSidebarItem({ label:'Search', icon:'search', tooltip:'Search collections (Ctrl+Shift+S)', onClick:()=>this._openPanel() });
+    this._sidebarItem=this.ui.addSidebarItem({ label:'Search', icon:'search', tooltip:'Search collections (⌘⇧S · Ctrl+Shift+S)', onClick:()=>this._openPanel() });
 
-    this._keyHandler=(e)=>{ if((e.metaKey||e.ctrlKey)&&e.shiftKey&&e.key==='S'){e.preventDefault();this._openPanel();} };
+    this._keyHandler=(e)=>{
+      const k=(e.key||'').toLowerCase();
+      if ((e.metaKey||e.ctrlKey)&&e.shiftKey&&k==='s') { e.preventDefault(); this._openPanel(); }
+    };
     document.addEventListener('keydown',this._keyHandler,true);
 
     await this._buildIndex();

@@ -1,6 +1,6 @@
 # WorkflowSearch
 
-**Version 1.0.2**
+**Version 1.0.3**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
@@ -73,16 +73,20 @@ When the query uses either form, the result row can be **expanded** (chevron) to
 |----------|--------|
 | ↑ / ↓ | Move selection in the result list. |
 | Enter | Open the selected record in an adjacent panel. |
-| Cmd/Ctrl+Shift+S | Open or focus the search panel. |
-| Cmd/Ctrl+S | Save the current query (when the search box has focus). |
+| **⌘⇧S** (Mac) / **Ctrl+Shift+S** (Windows & Linux) | Open or focus the search panel. |
+| **⌘S** (Mac) / **Ctrl+S** (Windows & Linux) | Save the current query (when the search box has focus). |
 
 ## Result list
 
 - **Name matches** first, then a **Body matches** section when hits rely on body (or cross-field) text.
 - Rows can show **tags** (up to five) and a **body** badge when the hit is primarily from body text.
-- **Order (v1.0.2+):** Within each section, results are grouped by **collection** (collections stay in **first-seen** order). **Titles are sorted A–Z** within each collection (case-insensitive, locale-aware).
+- **Order (since v1.0.2):** Within each section, results are grouped by **collection** (collections stay in **first-seen** order). **Titles are sorted A–Z** within each collection (case-insensitive, locale-aware).
 
 ## Changelog
+
+### 1.0.3
+
+- **Open-search shortcut:** Documented explicitly as **⌘⇧S** on macOS and **Ctrl+Shift+S** on Windows/Linux (sidebar tooltip and README). The global key handler matches **`s`** case-insensitively so **Shift+S** is recognized whether the browser reports `s` or `S`.
 
 ### 1.0.2
 
