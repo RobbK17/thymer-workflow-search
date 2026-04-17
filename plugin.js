@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.0.9
+   * Version 1.1.0
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -22,6 +22,7 @@
    *   -"phrase"       → exclude records whose title+body contain phrase
    *   created: / updated: → filter by record date (local calendar day; see README)
    *   in:record: / in:col: / under:line: → GUID-backed scope (see README; filter picker)
+   *   title: / body: → restrict text terms to record name or body (segment prefix)
    *   : (after word or alone) → autocomplete is: / created: / updated: / mentions: / in: / under:
    *
    * Keyboard:
@@ -33,7 +34,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.0.9';
+  const WS_VERSION = '1.1.0';
 
   /** Autocomplete after `:` — matches QueryParser / README (`is:`, dates, `mentions:`). */
   const WS_AC_COLON_OPS = [
@@ -45,6 +46,8 @@
     { label:'in:record:…', insert:'in:record:', detail:'one note — use Scope (filter) to pick' },
     { label:'in:col:…', insert:'in:col:', detail:'one collection — use Scope to pick' },
     { label:'under:line:…', insert:'under:line:', detail:'subtree under a heading — use Scope' },
+    { label:'title: …', insert:'title: ', detail:'restrict text terms to record title only' },
+    { label:'body: …', insert:'body: ', detail:'restrict text terms to record body only' },
   ];
 
   function wsAcColonOpsMatch(prefix) {
@@ -463,12 +466,13 @@
     return { personRefs, mentionRefs };
   }
 
-  /** When false, skip `searchByQuery`: exclusions apply only to indexed title+body; the API cannot express them. */
+  /** When false, skip `searchByQuery`: exclusions apply only to indexed title+body; the API cannot express them. `title:`/`body:` cannot be expressed by the API. */
   function wsSearchByQueryAllowed(parsed) {
     if (!parsed) return false;
     if (parsed.scope&&parsed.scope.underLineGuid) return false;
     const groups=parsed.type==='or'?parsed.groups:[parsed];
     for (const g of groups) {
+      if (g.textScope&&g.textScope!=='both') return false;
       if ((g.excludeTerms&&g.excludeTerms.length)||(g.excludePhrases&&g.excludePhrases.length)) return false;
     }
     return true;
@@ -615,10 +619,14 @@
       return parsed.groups.some(g=>{
         const ph=g.phrases||[], t=g.terms||[];
         if (!ph.length&&!t.length) return true;
+        if ((g.textScope||'both')==='title') return false;
         return wsTextMatchesQueryLower(textLower,ph,t);
       });
     }
-    return wsTextMatchesQueryLower(textLower,parsed.phrases||[],parsed.terms||[]);
+    const ph=parsed.phrases||[], t=parsed.terms||[];
+    if (!ph.length&&!t.length) return true;
+    if ((parsed.textScope||'both')==='title') return false;
+    return wsTextMatchesQueryLower(textLower,ph,t);
   }
   /** Preview: include a line if it fully matches the text query, or contains any term/phrase (so split terms across lines still surface hits). */
   function wsLineMatchesUnderPreviewLine(textLower,parsed) {
@@ -626,10 +634,12 @@
     if (wsLineTextMatchesParsedQuery(textLower,parsed)) return true;
     if (parsed.type==='or') {
       return parsed.groups.some(g=>{
+        if ((g.textScope||'both')==='title') return false;
         const ph=g.phrases||[], t=g.terms||[];
         return ph.some(p=>textLower.includes(p))||t.some(x=>textLower.includes(x));
       });
     }
+    if ((parsed.textScope||'both')==='title') return false;
     const ph=parsed.phrases||[], t=parsed.terms||[];
     return ph.some(p=>textLower.includes(p))||t.some(x=>textLower.includes(x));
   }
@@ -793,9 +803,15 @@
     _parseSegment(raw) {
       if (raw === undefined || raw === null) return null;
       if (!String(raw).trim()) {
-        return { includeTags:[],excludeTags:[],phrases:[],excludePhrases:[],excludeTerms:[],terms:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null} };
+        return { includeTags:[],excludeTags:[],phrases:[],excludePhrases:[],excludeTerms:[],terms:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null},textScope:'both' };
       }
-      let s=raw;
+      let s=String(raw).trim();
+      let textScope='both';
+      const head=s.match(/^(title|body):\s*/i);
+      if (head) {
+        textScope=head[1].toLowerCase()==='title'?'title':'body';
+        s=s.slice(head[0].length);
+      }
       const includeTags=[],excludeTags=[],phrases=[],excludeTerms=[];
       const personRefs=[];      // { token, wildcard, mode:'backlink'|'field', field:string|null }
       const mentionRefs=[];     // { token, wildcard }
@@ -869,7 +885,7 @@
         !personRefs.length&&!mentionRefs.length&&!hasDate;
       if (isEmpty) return null;
 
-      return { includeTags,excludeTags,phrases,excludePhrases,excludeTerms,terms,isCompleted,personRefs,mentionRefs,dateFilters };
+      return { includeTags,excludeTags,phrases,excludePhrases,excludeTerms,terms,isCompleted,personRefs,mentionRefs,dateFilters,textScope };
     }
   }
 
@@ -1031,11 +1047,16 @@
       if (!wsEntryMatchesDateFilters(entry,df||null)) return false;
       const excludeTerms=group.excludeTerms||[],excludePhrases=group.excludePhrases||[];
       const scope=parsed&&parsed.scope?parsed.scope:{};
+      const ts=group.textScope||'both';
       let combined;
       if (scope.underLineGuid) {
         const sub=this._lineSubtreeLower.get(scope.underLineGuid);
         if (sub===undefined) return false;
         combined=sub;
+      } else if (ts==='title') {
+        combined=entry.nameLower;
+      } else if (ts==='body') {
+        combined=entry.bodyLower!==undefined?entry.bodyLower:'';
       } else {
         const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
         combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
@@ -1131,7 +1152,8 @@
     }
 
     _filterGroupWithBody(group,limit,parsed) {
-      const {includeTags,excludeTags,phrases,excludeTerms,excludePhrases=[],terms,isCompleted=null,dateFilters}=group;
+      const {includeTags,excludeTags,phrases,excludeTerms,excludePhrases=[],terms,isCompleted=null,dateFilters,textScope:tsRaw}=group;
+      const ts=tsRaw||'both';
       const nameMatches=[],bodyMatches=[];
       const scope=parsed&&parsed.scope?parsed.scope:{};
 
@@ -1151,14 +1173,19 @@
         if (!wsEntryMatchesDateFilters(entry,dateFilters||null)) continue;
 
         const underLine=scope.underLineGuid;
+        const nameLower=entry.nameLower;
+        const bodyOnly=entry.bodyLower!==undefined?entry.bodyLower:'';
         let combined;
         if (underLine) {
           const sub=this._lineSubtreeLower.get(underLine);
           if (sub===undefined) continue;
           combined=sub;
+        } else if (ts==='title') {
+          combined=nameLower;
+        } else if (ts==='body') {
+          combined=bodyOnly;
         } else {
-          const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
-          combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
+          combined=bodyOnly?nameLower+' '+bodyOnly:nameLower;
         }
         if (excludeTerms.some(t=>combined.includes(t))) continue;
         if (excludePhrases.some(p=>combined.includes(p))) continue;
@@ -1169,7 +1196,11 @@
           nameMatches.push(entry);
         } else if (underLine) {
           if (this._matchesText(combined,phrases,terms)) bodyMatches.push({...entry,_bodyMatch:true});
-        } else if (this._matchesText(entry.nameLower,phrases,terms)) {
+        } else if (ts==='title') {
+          if (this._matchesText(nameLower,phrases,terms)) nameMatches.push(entry);
+        } else if (ts==='body') {
+          if (this._matchesText(bodyOnly,phrases,terms)) bodyMatches.push({...entry,_bodyMatch:true});
+        } else if (this._matchesText(nameLower,phrases,terms)) {
           nameMatches.push(entry);
         } else if (this._matchesText(combined,phrases,terms)) {
           bodyMatches.push({...entry,_bodyMatch:true});
@@ -1697,7 +1728,7 @@
       if (!body||this._configMode) return;
       const count=this._index.size();
       if (count>0) {
-        body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; -"phrase" &nbsp; use OR (capital) for union<br>@person &nbsp; ⌃Space saved &nbsp; · &nbsp; filter button &nbsp; in:/under: &nbsp; · &nbsp; autocomplete: # &nbsp; @ &nbsp; : &nbsp; or→OR<br>is:completed &nbsp; -is:completed &nbsp; created: &nbsp; updated: &nbsp; mentions:</div></div>`;
+        body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; -"phrase" &nbsp; use OR (capital) for union<br>@person &nbsp; ⌃Space saved &nbsp; · &nbsp; filter button &nbsp; in:/under: &nbsp; · &nbsp; autocomplete: # &nbsp; @ &nbsp; : &nbsp; or→OR<br>title: / body: &nbsp; · &nbsp; is:completed &nbsp; -is:completed &nbsp; created: &nbsp; updated: &nbsp; mentions:</div></div>`;
       } else {
         body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('loader')}</div><div>Building index…</div></div>`;
       }

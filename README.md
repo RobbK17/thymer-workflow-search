@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.0.9**
+**Version 1.1.0**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.0.9)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It adds **search autocomplete** under the search field (`#` tags, **`@`** people, **`:`** / **`word:`** operators, **` or `** → **` OR `**, **⌃Space** saved searches). **Exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`** or **`-"phrase"`** are present (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
+**Current release (v1.1.0)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It adds **`title:`** / **`body:`** segment prefixes to restrict text terms to the record **name** or **body** (see **Search syntax**). It builds on **v1.0.9** **search autocomplete** (`#` tags, **`@`** people, **`:`** operators, **` or `** → **` OR `**, **⌃Space** saved searches). **Exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, or **`title:`**/**`body:`** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
 
 ## Contents
 
@@ -19,13 +19,13 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **Tags** from the configured record property (default `Tags`) plus `#…` tokens in the record title; property name lookups are **case-insensitive** (e.g. `tags` vs `Tags`).
 - **Path tags** (`#self/work`) and **prefix** include (`#self/`, `#self/*`) for a namespace (`self` or `self/…`).
 - **Exclude tags** with different rules for plain (`-#self`), path (`-#self/foo`), and prefix (`-#self/`, `-#self/*`).
-- **Title + body** matching for non-tag query parts (phrase, terms, `-term`, **exclude phrases** `-"like this"`); body text is filled in **after** a first-pass index, then the current query is re-run.
+- **Title + body** matching for non-tag query parts (phrase, terms, `-term`, **exclude phrases** `-"like this"`); body text is filled in **after** a first-pass index, then the current query is re-run. **v1.1.0:** optional **`title:`** or **`body:`** at the start of a segment restricts **text** to the record **name** or **body** only (see **Text** below).
 - **Date filters** **`created:`** and **`updated:`** on each record (see below); dates use the **browser’s local timezone** for calendar-day boundaries.
 - **Async** `searchByQuery` for plain terms/phrases when the query has **no** **`-word`** or **`-"phrase"`** text exclusions (otherwise the plugin uses the local index only so exclusions match **`nameLower` + `bodyLower`**). When `searchByQuery` runs, merges respect the same hashtag, completion, **date**, **exclude-phrase**, and person filters as the index.
 - **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **People (@-syntax)** — optional **People collection** and name field in settings; resolve `@name`, `mentions:@name`, `fieldname:@name`, wildcards, and escaped `\@…` (see below). **v1.0.5+:** expand-row previews for **linked properties**, **mention lines**, or **tasks** depending on query (see **Expand preview**). **v1.0.6:** mentions lines show **@Name** badges per matched person (via `people.getDisplayName`); **v1.0.7:** mentions lines use **depth-based indentation** like task preview.
 - **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
-- **Autocomplete (v1.0.9):** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, and **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**); after **` or `** (lowercase), offers **` OR `** (parser requires capital **`OR`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
+- **Autocomplete:** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**), and **`title:`** / **`body:`**; after **` or `** (lowercase), offers **` OR `** (parser requires capital **`OR`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
 - **Settings** (gear): included collections, **Hashtag property name**, and **People (@-syntax)** (People collection + optional name property).
 
 ## Search syntax
@@ -41,6 +41,8 @@ Whitespace separates tokens. Matching is **case-insensitive** for text and tags.
 | `"exact phrase"` | Phrase must appear in the same combined text. |
 | `-word` | Exclude rows where **title or body** combined contains `word`. |
 | `-"exact phrase"` | Exclude rows where **title + body** combined contain this phrase (substring, case-insensitive). Optional space after `-` is allowed (e.g. `- "foo bar"`). Parsed **before** include phrases so include quotes are not confused with excludes. |
+
+**Title / body only:** At the **start of a segment** (before **`OR`**), **`title:`** or **`body:`** restricts **plain text** terms and **quoted phrases** to the record **name** (`title:`) or **body** (`body:`) only. Tags, **`@`**, dates, **`is:completed`**, etc. still apply to the whole record. **`title:`** / **`body:`** are ignored for **`searchByQuery`** merges (index-only for those queries). With **`under:line:`**, text matching uses the **subtree** only (same as default scoped search); **`title:`** does not apply to individual lines in previews.
 
 ### Hashtags (include)
 
@@ -179,9 +181,13 @@ Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment
 
 ## Changelog
 
+### 1.1.0
+
+- **`title:`** / **`body:`** — Optional **segment** prefix (case-insensitive) restricts **plain text** terms and phrases to the record **name** or **body** only (`textScope` on parsed groups). **`wsSearchByQueryAllowed`** skips **`searchByQuery`** when any segment uses **`title:`** or **`body:`** (API cannot express the split). **Preview** lines under **`under:line:`** do not match **`title:`** text (record title is not line text). **`QueryParser._parseSegment`**, **`SearchIndex._filterGroupWithBody`**, **`_entryMatchesGroup`**, **`wsLineTextMatchesParsedQuery`**, **`wsLineMatchesUnderPreviewLine`**.
+
 ### 1.0.9
 
-- **Search autocomplete:** Dropdown under the search field for **`#`…** (tags from the index), **`@`…** at the end of the query (People index, when configured — works after **`mentions:`**, whitespace, etc.; skips **`word@`**-style positions), **`:`** / **`word:`** ( **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`** ), and lowercase **` or `** → insert **` OR `** (union). **⌃Space** lists **saved searches** (same data as **Saved:** chips). **Option A** keyboard: when open, **↑↓** / **Enter** / **Esc** apply to suggestions; **Tab** closes suggestions. **`SearchIndex.getAllTagsSorted`**, **`PeopleIndex.suggestByPrefix`**, **`WS_AC_COLON_OPS`**.
+- **Search autocomplete:** Dropdown under the search field for **`#`…** (tags from the index), **`@`…** at the end of the query (People index, when configured — works after **`mentions:`**, whitespace, etc.; skips **`word@`**-style positions), **`:`** / **`word:`** ( **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`** ), and lowercase **` or `** → insert **` OR `** (union). **⌃Space** lists **saved searches** (same data as **Saved:** chips). **Functionality** keyboard: when open, **↑↓** / **Enter** / **Esc** apply to suggestions; **Tab** closes suggestions. **`SearchIndex.getAllTagsSorted`**, **`PeopleIndex.suggestByPrefix`**, **`WS_AC_COLON_OPS`**.
 
 ### 1.0.8
 
