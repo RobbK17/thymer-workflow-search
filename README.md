@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.1.1**
+**Version 1.1.2**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.1.1)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.1** adds **` AND `** (capital **AND**) between segments for **intersection** (e.g. **`title:… AND body:…`**), **autocomplete** after **` and `** → **` AND `** (parallel to **` OR `**), **`under:line:`** fixes (line parent fields, nested line items, preview alignment), **merged** index + **`searchByQuery`** body results (no longer dropping local hits), and a higher per-record **body text** index cap. It includes **v1.1.0** **`title:`** / **`body:`** prefixes, **v1.0.9** **search autocomplete** (`#` / **`@`** / **`:`** / **` or `**→**` OR `** / **⌃Space** saved searches), **exclude phrases**, **created:** / **updated:**, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, **`title:`**/**`body:`**, or **` AND `** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
+**Current release (v1.1.2)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.2** improves **expand-row preview** (correct titles for linked **records** and **collections**, fewer spurious lines, clearer scope badges) and adds **hybrid preview navigation**: **⌘+click** / **Ctrl+click** opens the link target, **right-click** opens a menu (**Open in source note** vs **Open linked record** / **Open link target**), with a matching footer hint. **v1.1.1** added **` AND `** (capital **AND**) between segments for **intersection** (e.g. **`title:… AND body:…`**), **autocomplete** after **` and `** → **` AND `** (parallel to **` OR `**), **`under:line:`** fixes (line parent fields, nested line items, preview alignment), **merged** index + **`searchByQuery`** body results (no longer dropping local hits), and a higher per-record **body text** index cap. It includes **v1.1.0** **`title:`** / **`body:`** prefixes, **v1.0.9** **search autocomplete** (`#` / **`@`** / **`:`** / **` or `**→**` OR `** / **⌃Space** saved searches), **exclude phrases**, **created:** / **updated:**, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, **`title:`**/**`body:`**, or **` AND `** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
 
 ## Contents
 
@@ -109,9 +109,9 @@ If a record has **no** usable timestamp for a field you filter on, it **does not
 
 ### Expand preview (chevron on results)
 
-A **chevron** appears on each result row when the query includes **`under:line:`** or **`in:record:`** with **text** terms/phrases, **task completion** (`is:completed` / `-is:completed`), or resolvable **person-related** syntax: bare **`@…`**, **`fieldname:@…`**, or **`mentions:`** (People index must resolve at least one person GUID). Tooltips reflect context (“Preview lines matching your terms”, “Preview matching lines in this note”, “Preview matching tasks”, “Preview mentions”, “Preview linked properties”).
+A **chevron** appears on each result row when the query includes **`under:line:`** or **`in:record:`** (with or without separate text terms — scope alone still opens the subtree / whole-note preview), **task completion** (`is:completed` / `-is:completed`), or resolvable **person-related** syntax: bare **`@…`**, **`fieldname:@…`**, or **`mentions:`** (People index must resolve at least one person GUID). Tooltips reflect context (“Preview lines matching your terms”, “Preview matching lines in this note”, “Preview matching tasks”, “Preview mentions”, “Preview linked properties”).
 
-**Priority:** **`under:line:`** + text → subtree lines; else **`in:record:`** + text → **whole note** (title hit + matching body lines); else **task** → **mentions** → **property**. (If **`under:`** and **`in:record:`** / **`is:completed`** overlap, **under** preview wins.)
+**Priority:** **`under:line:`** → subtree lines; else **`in:record:`** → **whole note** (title hit + matching body lines, or all lines when there are no text terms); else **task** → **mentions** → **property**. (If **`under:`** and **`in:record:`** / **`is:completed`** overlap, **under** preview wins.)
 
 | Syntax (examples) | Preview content | Click action |
 |---------------------|-----------------|--------------|
@@ -184,6 +184,11 @@ Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_save
 Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment contains person or mention clauses: person names resolve against `PeopleIndex`; **`mentions:`** uses the reverse mention index; bare **`@name`** backlink filters scan record links via **`linkedRecords()`** and field-specific filters only inspect the named property.
 
 ## Changelog
+
+### 1.1.2
+
+- **Preview labels** — Resolve linked **record** titles with `getRecord` when not in the index; resolve **collection** (and plugin) links with `getPluginByGuid` + `getName`. Drop GUID/line-id placeholders and lines with nothing to show; scope-preview **@** badges only when the query filters people.
+- **Preview navigation** — **⌘+click** (macOS) / **Ctrl+click** (Windows/Linux) opens the **link target** (record editor or collection **overview**); **right-click** offers **Open in source note** vs **Open linked record** / **Open link target**. Footer shows the modifier shortcut (`⌘+click opens link` or `Ctrl+click opens link`).
 
 ### 1.1.1
 

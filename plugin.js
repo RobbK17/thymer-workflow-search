@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.1
+   * Version 1.1.2
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -35,7 +35,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.1';
+  const WS_VERSION = '1.1.2';
 
   /** Line-derived body text indexed per record (beyond this, terms in the tail are not matched locally). */
   const WS_BODY_INDEX_MAX_CHARS = 100000;
@@ -198,6 +198,14 @@
     .ws-preview-prop-name { color: #8a7e6a; flex-shrink: 0; }
     .ws-preview-prop-arrow { color: #8a7e6a; flex-shrink: 0; }
     .ws-preview-prop-value { color: #a8d8ff; }
+    .ws-preview-ctx-menu { position: fixed; z-index: 100000; min-width: 200px; padding: 4px 0; border-radius: 8px;
+      background: #2a2620; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 8px 28px rgba(0,0,0,0.5);
+      font-size: 11px; color: #e8e0d0; }
+    .ws-preview-ctx-item {
+      display: block; width: 100%; text-align: left; padding: 7px 12px; border: none; background: transparent;
+      color: inherit; font: inherit; cursor: pointer; white-space: nowrap;
+    }
+    .ws-preview-ctx-item:hover { background: rgba(124,106,247,0.2); color: #fff; }
     .ws-result { flex: 1; min-width: 0; padding: 6px 12px 6px 4px; cursor: pointer; transition: background 0.08s; }
     .ws-result:hover { background: rgba(255,255,255,0.04); }
     .ws-result-main { display: flex; align-items: center; gap: 7px; min-width: 0; }
@@ -603,11 +611,216 @@
     }
     return out;
   }
-  function wsTextFromLineItem(li) {
-    try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join('').trim(); } catch(e) { return ''; }
+  /**
+   * Segment types whose text contributes to search, `under:line:` subtree index, and previews.
+   * Includes **`link`** (URLs) and **`ref`** (outline links to records / external targets — not **`mention`**, which stores a person GUID string).
+   */
+  const WS_LINE_TEXT_SEGMENT_TYPES = ['text','bold','italic','code','hashtag','link','ref','url','bookmark','hyperlink'];
+
+  /** Object shapes used by `link` / `ref` / similar segments for display text. */
+  function wsPlainTextFromLinkLikeObject(o) {
+    if (!o || typeof o !== 'object') return '';
+    const keys = ['name','title','label','displayName','text','url','href'];
+    for (const k of keys) {
+      if (typeof o[k] === 'string' && o[k]) return o[k];
+    }
+    return '';
+  }
+
+  /** Plain text from a line segment for indexing and display; supports link/ref labels and URL fallbacks. */
+  function wsPlainTextFromSegment(s) {
+    try {
+      if (!s) return '';
+      if (typeof s.text === 'string') return s.text;
+      if (s.text && typeof s.text === 'object') {
+        const fromObj = wsPlainTextFromLinkLikeObject(s.text);
+        if (fromObj) return fromObj;
+      }
+      for (const k of ['label','name','title','displayName']) {
+        if (typeof s[k] === 'string' && s[k]) return s[k];
+      }
+      if (s.type === 'link' || s.type === 'ref' || s.type === 'url' || s.type === 'bookmark' || s.type === 'hyperlink') {
+        if (typeof s.url === 'string') return s.url;
+        if (typeof s.href === 'string') return s.href;
+      }
+      return '';
+    } catch (e) { return ''; }
+  }
+
+  /** When segments use uncommon `type` values, still recover outline link text (record title, URL, etc.). */
+  function wsTextFromLineItemFallback(li) {
+    try {
+      if (typeof li.plainText === 'string' && li.plainText.trim()) return li.plainText.trim();
+      if (typeof li.text === 'string' && li.text.trim()) return li.text.trim();
+      if (typeof li.content === 'string' && li.content.trim()) return li.content.trim();
+      for (const m of ['getPlainText','getLineText','getText','getDisplayText','toPlainText','getPreviewText']) {
+        try {
+          if (typeof li[m] === 'function') {
+            const t = li[m]();
+            if (typeof t === 'string' && t.trim()) return t.trim();
+          }
+        } catch (e2) {}
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /**
+   * Resolve a ref/link target GUID: indexed record → `getRecord` → **collection or global plugin** via
+   * `getPluginByGuid` (collection links use the collection’s plugin GUID, not a record GUID) → People name.
+   */
+  function wsResolveGuidTargetTitle(guid, recordEntryMap, data, peopleIndex) {
+    if (typeof guid !== 'string' || guid.length < 8) return '';
+    const ent = recordEntryMap && recordEntryMap.get(guid);
+    if (ent) {
+      const n = (ent.displayName || ent.name || '').trim();
+      return n || '(untitled)';
+    }
+    if (data && typeof data.getRecord === 'function') {
+      try {
+        const r = data.getRecord(guid);
+        if (r && typeof r.getName === 'function') {
+          const nm = (r.getName() || '').trim();
+          if (nm) return nm;
+          return '(untitled)';
+        }
+      } catch (e) {}
+    }
+    if (data && typeof data.getPluginByGuid === 'function') {
+      try {
+        const plug = data.getPluginByGuid(guid);
+        if (plug && typeof plug.getName === 'function') {
+          const nm = (plug.getName() || '').trim();
+          if (nm) return nm;
+        }
+      } catch (e) {}
+    }
+    if (peopleIndex && peopleIndex.isConfigured()) {
+      const pn = peopleIndex.getDisplayName(guid);
+      if (pn) return pn;
+    }
+    return '';
+  }
+
+  /** Footer / UI copy: ⌘ on Apple platforms, Ctrl elsewhere. */
+  function wsModClickLinkHint() {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.userAgentData && navigator.userAgentData.platform === 'macOS') return '⌘+click opens link';
+      if (typeof navigator !== 'undefined' && /Mac|iPhone|iPod|iPad/i.test(navigator.platform || '')) return '⌘+click opens link';
+    } catch (e) {}
+    return 'Ctrl+click opens link';
+  }
+
+  /**
+   * First navigable link target on a line: workspace record (`getRecord`) or collection/global plugin (`getPluginByGuid`).
+   */
+  function wsPreviewLineLinkTarget(li, data) {
+    if (!li || !data) return null;
+    const tryGuid = (g) => {
+      if (typeof g !== 'string' || g.length < 8) return null;
+      try {
+        if (typeof data.getRecord === 'function') {
+          const r = data.getRecord(g);
+          if (r) return { kind: 'record', guid: g };
+        }
+      } catch (e) {}
+      try {
+        if (typeof data.getPluginByGuid === 'function') {
+          const plug = data.getPluginByGuid(g);
+          if (plug) return { kind: 'collection', guid: g };
+        }
+      } catch (e) {}
+      return null;
+    };
+    for (const k of ['linkedRecordGuid', 'linked_record_guid', 'targetRecordGuid', 'target_guid', 'rootRecordGuid', 'recordLinkGuid', 'linkRecordGuid', 'link_guid']) {
+      const t = tryGuid(li[k]);
+      if (t) return t;
+    }
+    for (const seg of li.segments || []) {
+      if ((seg.type === 'ref' || seg.type === 'link') && seg.text && typeof seg.text === 'object' && seg.text.guid) {
+        const t = tryGuid(seg.text.guid);
+        if (t) return t;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Outline links to other notes often use `ref` segments with only a target **guid** (no title in JSON).
+   * Resolve via `wsResolveGuidTargetTitle` (index, record, **collection**, people).
+   */
+  function wsLinkedRecordTitleFromLine(li, recordEntryMap, data) {
+    if (!recordEntryMap || !li) return '';
+    try {
+      const tryEntry = (guid) => wsResolveGuidTargetTitle(guid, recordEntryMap, data, null);
+      for (const k of ['linkedRecordGuid','linked_record_guid','targetRecordGuid','target_guid','rootRecordGuid','recordLinkGuid','linkRecordGuid','link_guid']) {
+        const t = tryEntry(li[k]);
+        if (t) return t;
+      }
+      for (const seg of li.segments || []) {
+        if ((seg.type === 'ref' || seg.type === 'link') && seg.text && typeof seg.text === 'object' && seg.text.guid) {
+          const t = tryEntry(seg.text.guid);
+          if (t) return t;
+        }
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /**
+   * Single-line label for scope / mention previews when raw `wsTextFromLineItem` is empty (outline links, refs).
+   * Uses index → record → **collection / plugin** → People. No GUID/line-id placeholders.
+   * Returns **''** when there is nothing to show — caller should **skip** that row.
+   */
+  function wsPreviewLineLabel(li, rawText, recordEntryMap, peopleIndex, data) {
+    const t = String(rawText || '').trim();
+    if (t) return t;
+    const linked = wsLinkedRecordTitleFromLine(li, recordEntryMap, data);
+    if (linked) return linked;
+    try {
+      for (const seg of li.segments || []) {
+        const o = seg && seg.text && typeof seg.text === 'object' ? seg.text : null;
+        const g = o && typeof o.guid === 'string' ? o.guid : null;
+        if (!g) continue;
+        if (seg.type === 'ref' || seg.type === 'link') {
+          const name = wsResolveGuidTargetTitle(g, recordEntryMap, data, peopleIndex);
+          if (name) return name;
+          return '';
+        }
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /**
+   * @param {object} li — line item from `record.getLineItems`
+   * @param {{recordEntryMap?: Map<string, object>, data?: object}} [opts] — pass `recordEntryMap: index._entries`; optional `data` for `getRecord` titles off-index
+   */
+  function wsTextFromLineItem(li, opts) {
+    try {
+      opts = opts || {};
+      const recordEntryMap = opts.recordEntryMap;
+      const data = opts.data;
+      const segs = li.segments || [];
+      let out = segs
+        .filter(s => WS_LINE_TEXT_SEGMENT_TYPES.includes(s.type))
+        .map(wsPlainTextFromSegment)
+        .join('')
+        .trim();
+      if (!out) {
+        out = segs
+          .filter(s => s.type !== 'mention')
+          .map(wsPlainTextFromSegment)
+          .join('')
+          .trim();
+      }
+      if (!out) out = wsTextFromLineItemFallback(li);
+      if (!out) out = wsLinkedRecordTitleFromLine(li, recordEntryMap, data);
+      return out;
+    } catch (e) { return ''; }
   }
   /** Per-line-guid → lowercased text of that line plus all descendants (for `under:line:`). */
-  function wsBuildSubtreeLowerMap(recordGuid, lineItems) {
+  function wsBuildSubtreeLowerMap(recordGuid, lineItems, recordEntryMap) {
     const memo=new Map();
     const byGuid=new Map((lineItems||[]).map(li=>[li.guid,li]));
     const children=new Map();
@@ -621,7 +834,7 @@
       if (memo.has(nodeGuid)) return memo.get(nodeGuid);
       const li=byGuid.get(nodeGuid);
       if (!li) { memo.set(nodeGuid,''); return ''; }
-      let t=wsTextFromLineItem(li).toLowerCase();
+      let t=wsTextFromLineItem(li,{recordEntryMap}).toLowerCase();
       for (const ch of (children.get(nodeGuid)||[])) t+=' '+dfs(ch.guid);
       const out=t.replace(/\s+/g,' ').trim();
       memo.set(nodeGuid,out);
@@ -716,7 +929,7 @@
     return s;
   }
   /**
-   * Resolved person GUIDs from @ / mentions: query clauses. Null = no person filter (show all people on line).
+   * Resolved person GUIDs from @ / mentions: query clauses. Null = no person filter (no badges in scope preview).
    */
   function wsResolveQueryPersonGuids(parsed, peopleIndex) {
     const pf=wsPersonPreviewFilter(parsed);
@@ -732,13 +945,13 @@
     }
     return out;
   }
-  /** Expanded in:record / under:line preview row: line text + @ badges (mentions-style). */
-  function wsCreateScopePreviewLineDiv(entry, li, depth, text, peopleIndex, parsed, onNavigate) {
+  /** Expanded in:record / under:line preview row: line text + @ badges (mentions-style). `displayText` is usually from `wsPreviewLineLabel`. */
+  function wsCreateScopePreviewLineDiv(entry, li, depth, displayText, peopleIndex, parsed, onLineAction) {
     const lineGuids=wsLinePersonGuids(li);
     const queryGuids=wsResolveQueryPersonGuids(parsed, peopleIndex);
     let toShow;
     if (queryGuids===null) {
-      toShow=lineGuids;
+      toShow=new Set();
     } else {
       toShow=new Set();
       for (const g of lineGuids) if (queryGuids.has(g)) toShow.add(g);
@@ -749,17 +962,20 @@
     div.style.paddingLeft=(10+Math.min(depth,12)*14)+'px';
     const textSpan=document.createElement('span');
     textSpan.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-    textSpan.textContent=text.slice(0,180)||(li.type==='task'?'(task)':'(empty line)');
+    const show = String(displayText || '').slice(0, 180) || (li.type === 'task' ? '(task)' : '');
+    textSpan.textContent = show || (li.guid ? '(empty line)' : '');
     div.appendChild(textSpan);
     for (const guid of toShow) {
-      const displayName=peopleIndex.isConfigured()?(peopleIndex.getDisplayName(guid)||guid.slice(0,8)):guid.slice(0,8);
+      const displayName=peopleIndex.isConfigured()?peopleIndex.getDisplayName(guid):'';
+      if (!displayName) continue;
       const badge=document.createElement('span');
       badge.style.cssText='flex-shrink:0;font-size:9px;color:#a8d8ff;background:rgba(100,180,255,0.10);border:1px solid rgba(100,180,255,0.22);border-radius:3px;padding:0 4px;white-space:nowrap;';
       badge.textContent='@'+displayName;
       div.appendChild(badge);
     }
     const ig=li.guid;
-    div.addEventListener('click',(e)=>{ e.stopPropagation(); onNavigate(entry,ig); });
+    div.addEventListener('click',(e)=>{ e.stopPropagation(); onLineAction(e,entry,li,ig); });
+    div.addEventListener('contextmenu',(e)=>{ e.preventDefault(); e.stopPropagation(); onLineAction(e,entry,li,ig); });
     return div;
   }
   async function wsFilterTaskLinesForPreview(record,lineItems,wantCompleted) {
@@ -1031,7 +1247,7 @@
           this._lineToRecordGuid.delete(x);
         }
       }
-      const memo=wsBuildSubtreeLowerMap(recordGuid,lineItems);
+      const memo=wsBuildSubtreeLowerMap(recordGuid,lineItems,this._entries);
       const newSet=new Set();
       for (const [lg,text] of memo) {
         this._lineSubtreeLower.set(lg,text);
@@ -1346,6 +1562,7 @@
       this._selectedIdx=-1; this._openedGuid=null;
       this._query=''; this._debounce=null; this._searchToken=0;
       this._expandedGuid=null; this._previewLoadToken=0;
+      this._previewCtxMenuEl=null; this._previewCtxMenuCleanup=null;
       this._configMode=false; this._saveMode=false; this._root=null;
       this._acOpen=false; this._acItems=[]; this._acSel=0; this._acEl=null;
       this._scopePicker=null;
@@ -1436,7 +1653,8 @@
 
     _buildFooter() {
       const footer=document.createElement('div'); footer.className='ws-footer';
-      footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">↑↓ results &nbsp;·&nbsp; ⏎ open &nbsp;·&nbsp; ⌘S save &nbsp;·&nbsp; ⌃Space saved &nbsp;·&nbsp; suggestions: ↑↓ ⏎ Esc</span>`;
+      const modHint=wsModClickLinkHint();
+      footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">↑↓ results &nbsp;·&nbsp; ⏎ open &nbsp;·&nbsp; ⌘S save &nbsp;·&nbsp; ⌃Space saved &nbsp;·&nbsp; ${modHint} &nbsp;·&nbsp; suggestions: ↑↓ ⏎ Esc</span>`;
       return footer;
     }
 
@@ -1532,6 +1750,11 @@
         if (e.key==='Escape') { e.preventDefault(); this._closeScopePicker(); }
         return;
       }
+      if (this._previewCtxMenuEl && e.key==='Escape') {
+        e.preventDefault();
+        this._closePreviewLineMenu();
+        return;
+      }
       if (this._saveMode) {
         if ((e.metaKey||e.ctrlKey)&&e.key==='s') e.preventDefault();
         return;
@@ -1588,7 +1811,8 @@
           const nameLower=entry.record.getName().toLowerCase();
           const bodyTerms=allTerms.filter(t=>!nameLower.includes(t));
           const searchTerms=bodyTerms.length?bodyTerms:allTerms;
-          const match=lineItems.find(li=>{ try { const text=(li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text.toLowerCase():'').join(' '); return searchTerms.every(t=>text.includes(t)); } catch(e) { return false; } });
+          const em=this._index._entries;
+          const match=lineItems.find(li=>{ try { const text=wsTextFromLineItem(li,{recordEntryMap:em}).toLowerCase(); return searchTerms.every(t=>text.includes(t)); } catch(e) { return false; } });
           if (!match) return;
           await new Promise(r=>setTimeout(r,350));
           await panel.navigateTo({itemGuid:match.guid,highlight:true});
@@ -1610,14 +1834,86 @@
       else { const newPanel=await this._plugin.ui.createPanel({afterPanel:this._panel}); if (newPanel) await doNav(newPanel); }
     }
 
+    _closePreviewLineMenu() {
+      if (this._previewCtxMenuCleanup) { try { this._previewCtxMenuCleanup(); } catch(e) {} this._previewCtxMenuCleanup=null; }
+      if (this._previewCtxMenuEl) { try { this._previewCtxMenuEl.remove(); } catch(e) {} this._previewCtxMenuEl=null; }
+    }
+
+    _showPreviewLineMenu(e,entry,li,ig) {
+      this._closePreviewLineMenu();
+      const target=wsPreviewLineLinkTarget(li,this._plugin.data);
+      const menu=document.createElement('div');
+      menu.className='ws-preview-ctx-menu';
+      const x=Math.min(e.clientX,typeof window!=='undefined'?window.innerWidth-220:e.clientX);
+      const y=Math.min(e.clientY,typeof window!=='undefined'?window.innerHeight-120:e.clientY);
+      menu.style.left=x+'px'; menu.style.top=y+'px';
+      const add=(label,fn)=>{
+        const b=document.createElement('button');
+        b.type='button'; b.className='ws-preview-ctx-item'; b.textContent=label;
+        b.addEventListener('click',(ev)=>{ ev.stopPropagation(); this._closePreviewLineMenu(); fn(); });
+        menu.appendChild(b);
+      };
+      add('Open in source note',()=>void this._navigateToRecordLine(entry,ig));
+      if (target) {
+        add(target.kind==='record'?'Open linked record':'Open link target',()=>void this._navigateToPreviewLinkTarget(li));
+      }
+      document.body.appendChild(menu);
+      this._previewCtxMenuEl=menu;
+      const close=()=>this._closePreviewLineMenu();
+      const onDoc=(ev)=>{ if (this._previewCtxMenuEl&&!this._previewCtxMenuEl.contains(ev.target)) close(); };
+      const onKey=(ev)=>{ if (ev.key==='Escape') close(); };
+      setTimeout(()=>{
+        document.addEventListener('mousedown',onDoc,true);
+        document.addEventListener('keydown',onKey,true);
+      },0);
+      this._previewCtxMenuCleanup=()=>{
+        document.removeEventListener('mousedown',onDoc,true);
+        document.removeEventListener('keydown',onKey,true);
+      };
+    }
+
+    async _navigateToPreviewLinkTarget(li) {
+      const t=wsPreviewLineLinkTarget(li,this._plugin.data);
+      if (!t) return;
+      const myId=this._panel.getId();
+      const allPanels=this._plugin.ui.getPanels()||[];
+      const candidates=allPanels.filter(p=>p.getId()!==myId&&!p.isSidebar());
+      const panel=candidates.find(p=>p.isActive())||candidates[0]||null;
+      const ws=this._plugin.getWorkspaceGuid();
+      const doNav=async(p)=>{
+        if (t.kind==='record') {
+          p.navigateTo({type:'edit_panel',rootId:t.guid,workspaceGuid:ws});
+        } else {
+          p.navigateTo({type:'overview',rootId:t.guid,subId:null,workspaceGuid:ws});
+        }
+        this._plugin.ui.setActivePanel(p);
+      };
+      if (panel) await doNav(panel);
+      else { const np=await this._plugin.ui.createPanel({afterPanel:this._panel}); if (np) await doNav(np); }
+    }
+
+    _onPreviewLineInteraction(e,entry,li,ig) {
+      if (e.type==='contextmenu') {
+        this._showPreviewLineMenu(e,entry,li,ig);
+        return;
+      }
+      if ((e.metaKey||e.ctrlKey)&&wsPreviewLineLinkTarget(li,this._plugin.data)) {
+        void this._navigateToPreviewLinkTarget(li);
+        return;
+      }
+      void this._navigateToRecordLine(entry,ig);
+    }
+
     _toggleExpand(entry) {
       this._expandedGuid=this._expandedGuid===entry.guid?null:entry.guid;
       this._renderResults();
     }
 
     async _loadPreviewFor(entry, previewContext, previewEl) {
+      this._closePreviewLineMenu();
       const tk=++this._previewLoadToken;
       previewEl.innerHTML=`<div class="ws-preview-loading">Loading…</div>`;
+      const txOpts={recordEntryMap:this._index._entries,data:this._plugin.data};
       try {
         if (previewContext.type==='underScope') {
           const anchorGuid=previewContext.anchorLineGuid;
@@ -1630,14 +1926,18 @@
           if (!subtree.size) { previewEl.innerHTML='<div class="ws-preview-empty">Could not resolve heading subtree</div>'; return; }
           const roots=wsRootLineItems(entry.record,flat);
           let found=0;
+          const idx=this._index;
           await wsForEachLineItemDeep(roots,(li,depth)=>{
             if (!subtree.has(li.guid)) return;
-            const text=wsTextFromLineItem(li);
-            const tl=text.toLowerCase();
+            if (!li.guid) return;
+            const raw=wsTextFromLineItem(li,txOpts);
+            const tl=raw.toLowerCase();
             if (!wsLineMatchesUnderPreviewLine(tl,pq)) return;
+            const label=wsPreviewLineLabel(li,raw,idx._entries,idx._people,this._plugin.data);
+            if (!label) return;
             found++;
-            const people=this._index._people;
-            const div=wsCreateScopePreviewLineDiv(entry,li,depth,text,people,pq,(e,ig)=>this._navigateToRecordLine(e,ig));
+            const people=idx._people;
+            const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,people,pq,(e,ent,li2,ig)=>this._onPreviewLineInteraction(e,ent,li2,ig));
             previewEl.appendChild(div);
           });
           if (!found) previewEl.innerHTML='<div class="ws-preview-empty">No matching lines in this subtree</div>';
@@ -1658,13 +1958,17 @@
             previewEl.appendChild(div);
           }
           const roots=wsRootLineItems(entry.record,items);
+          const idx2=this._index;
           await wsForEachLineItemDeep(roots,(li,depth)=>{
-            const text=wsTextFromLineItem(li);
-            const tl=text.toLowerCase();
+            if (!li.guid) return;
+            const raw=wsTextFromLineItem(li,txOpts);
+            const tl=raw.toLowerCase();
             if (!wsLineMatchesUnderPreviewLine(tl,pq)) return;
+            const label=wsPreviewLineLabel(li,raw,idx2._entries,idx2._people,this._plugin.data);
+            if (!label) return;
             found++;
-            const people=this._index._people;
-            const div=wsCreateScopePreviewLineDiv(entry,li,depth,text,people,pq,(e,ig)=>this._navigateToRecordLine(e,ig));
+            const people=idx2._people;
+            const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,people,pq,(e,ent,li2,ig)=>this._onPreviewLineInteraction(e,ent,li2,ig));
             previewEl.appendChild(div);
           });
           if (!found) previewEl.innerHTML='<div class="ws-preview-empty">No matching lines in this note</div>';
@@ -1677,12 +1981,18 @@
           const filtered=await wsFilterTaskLinesForPreview(entry.record,items,wantCompleted);
           previewEl.innerHTML='';
           if (!filtered.length) { previewEl.innerHTML='<div class="ws-preview-empty">No matching tasks</div>'; return; }
+          const idxT=this._index;
           for (const {li,depth} of filtered) {
+            if (!li.guid) continue;
+            const raw=wsTextFromLineItem(li,txOpts);
+            const label=wsPreviewLineLabel(li,raw,idxT._entries,idxT._people,this._plugin.data);
+            if (!label) continue;
             const div=document.createElement('div'); div.className='ws-preview-line';
             div.style.paddingLeft=(10+Math.min(depth,12)*14)+'px';
-            div.textContent=wsTextFromLineItem(li).slice(0,200)||'(empty task)';
+            div.textContent=label.slice(0,200)||'(empty task)';
             const ig=li.guid;
-            div.addEventListener('click',(e)=>{ e.stopPropagation(); this._navigateToRecordLine(entry,ig); });
+            div.addEventListener('click',(e)=>{ e.stopPropagation(); this._onPreviewLineInteraction(e,entry,li,ig); });
+            div.addEventListener('contextmenu',(e)=>{ e.preventDefault(); e.stopPropagation(); this._onPreviewLineInteraction(e,entry,li,ig); });
             previewEl.appendChild(div);
           }
 
@@ -1704,8 +2014,11 @@
               if (seg.type==='mention'&&typeof seg.text==='string'&&targetGuids.has(seg.text)) matchedGuids.add(seg.text);
             }
             if (!matchedGuids.size) return;
+            if (!li.guid) return;
+            const raw=wsTextFromLineItem(li,txOpts);
+            const label=wsPreviewLineLabel(li,raw,this._plugin._index._entries,this._plugin._index._people,this._plugin.data);
+            if (!label) return;
             found++;
-            const text=wsTextFromLineItem(li);
 
             // Row: indented line text + @name badge(s)
             const div=document.createElement('div'); div.className='ws-preview-line';
@@ -1714,7 +2027,8 @@
 
             const textSpan=document.createElement('span');
             textSpan.style.cssText='flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-            textSpan.textContent=text.slice(0,180)||(li.type==='task'?'(task)':'(empty line)');
+            const show=String(label).slice(0,180)||(li.type==='task'?'(task)':'');
+            textSpan.textContent=show||'(empty line)';
             div.appendChild(textSpan);
 
             for (const guid of matchedGuids) {
@@ -1726,7 +2040,8 @@
             }
 
             const ig=li.guid;
-            div.addEventListener('click',(e)=>{ e.stopPropagation(); this._navigateToRecordLine(entry,ig); });
+            div.addEventListener('click',(e)=>{ e.stopPropagation(); this._onPreviewLineInteraction(e,entry,li,ig); });
+            div.addEventListener('contextmenu',(e)=>{ e.preventDefault(); e.stopPropagation(); this._onPreviewLineInteraction(e,entry,li,ig); });
             previewEl.appendChild(div);
           });
 
@@ -1859,9 +2174,10 @@
       const wantCompletion=wsCompletionPreviewFilter(parsed);
       const personFilter=wsPersonPreviewFilter(parsed);
       const underGuid=parsed?.scope?.underLineGuid;
-      const underPreview=!!(underGuid&&wsHasTextualQuery(parsed));
+      // Chevron for scope previews whenever scope is set — not only when there are text terms (scope-only queries still get a subtree / whole-note preview).
+      const underPreview=!!underGuid;
       const inRecGuid=parsed?.scope?.inRecordGuid;
-      const inRecordPreview=!!(inRecGuid&&wsHasTextualQuery(parsed)&&!underGuid);
+      const inRecordPreview=!!(inRecGuid&&!underGuid);
 
       // Build preview context — determines what the chevron shows
       // Priority: under:line + text > in:record + text > task completion > mentions > property backlink
@@ -2401,17 +2717,21 @@
       }
       const roots=wsRootLineItems(entry.record,items);
       const rows=[];
+      const em=this._index._entries, pe=this._index._people;
       await wsForEachLineItemDeep(roots,(li,depth)=>{
-        const text=wsTextFromLineItem(li);
-        const line=`${text} ${li.guid||''}`.toLowerCase();
+        if (!li.guid) return;
+        const raw=wsTextFromLineItem(li,{recordEntryMap:em,data:this._plugin.data});
+        const label=wsPreviewLineLabel(li,raw,em,pe,this._plugin.data);
+        if (!label) return;
+        const line=`${label} ${li.guid}`.toLowerCase();
         if (filt&&!line.includes(filt)) return;
-        rows.push({ li, depth, text });
+        rows.push({ li, depth, text: label });
       });
       const pad0=6;
       let html='<button type="button" class="ws-scope-back">← Back to scope options</button><div class="ws-scope-hint">Select a line; matching uses this line and nested bullets only.</div>';
       html+=rows.map(({ li, depth, text })=>{
         const pad=pad0+Math.min(depth,12)*14;
-        const lab=text.slice(0,120)||'(empty line)';
+        const lab=text.slice(0,120);
         const gid=String(li.guid||'').replace(/"/g,'');
         return `<button type="button" class="ws-scope-item" style="padding-left:${pad}px" data-lineid="${gid}">${wsEsc(lab)}<small>${wsEsc(gid)}</small></button>`;
       }).join('');
@@ -2541,7 +2861,8 @@
       try {
         const items=await record.getLineItems(false);
         const flat=await wsFlattenLineItems(items);
-        const text=flat.map(li=>{ try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join(''); } catch(e){return '';} }).join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
+        const em=this._index._entries;
+        const text=flat.map(li=>wsTextFromLineItem(li,{recordEntryMap:em})).join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
         this._index.updateBodyText(record.guid,text);
         this._index.indexLineSubtrees(record.guid,flat);
         this._index.clearMentionsForRecord(record.guid);
@@ -2568,9 +2889,8 @@
     async _buildBodyIndex() {
       const entries=[...this._index._entries.values()];
       const BATCH=15;
-      const extractText=(lineItems)=>lineItems
-        .map(li=>{ try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join(''); } catch(e){return '';} })
-        .join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
+      const em=this._index._entries;
+      const extractText=(lineItems)=>lineItems.map(li=>wsTextFromLineItem(li,{recordEntryMap:em})).join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
 
       for (let i=0;i<entries.length;i+=BATCH) {
         const batch=entries.slice(i,i+BATCH);
