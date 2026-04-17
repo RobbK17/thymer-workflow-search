@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.0
+   * Version 1.1.1
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -12,6 +12,7 @@
    *   -#tag           → exclude tag
    *   -term           → exclude term
    *   A OR B          → union of two groups
+   *   A AND B         → intersection (capital AND); e.g. title:… AND body:…
    *   is:completed    → records with at least one completed task
    *   -is:completed   → records with at least one open task
    *   @name           → records linking to person named "name" (exact, case-insensitive)
@@ -34,7 +35,10 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.0';
+  const WS_VERSION = '1.1.1';
+
+  /** Line-derived body text indexed per record (beyond this, terms in the tail are not matched locally). */
+  const WS_BODY_INDEX_MAX_CHARS = 100000;
 
   /** Autocomplete after `:` — matches QueryParser / README (`is:`, dates, `mentions:`). */
   const WS_AC_COLON_OPS = [
@@ -301,10 +305,40 @@
     }
     return entryTags.includes(qn);
   }
+  /** Thymer line items may use `parent_guid` or `parentGuid`. */
+  function wsLineParentGuid(li) {
+    try {
+      if (!li) return undefined;
+      const a=li.parent_guid,b=li.parentGuid;
+      if (a!=null&&a!=='') return a;
+      if (b!=null&&b!=='') return b;
+    } catch(e) {}
+    return undefined;
+  }
+  /**
+   * Merge top-level `getLineItems` with nested rows from `children` / `getChildren()` (deduped by guid).
+   * Some APIs return a tree or omit nested lines from the root array; `under:line:` needs every row for parent links and subtree text.
+   */
+  async function wsFlattenLineItems(lineItems) {
+    const byGuid=new Map();
+    async function walk(list) {
+      for (const li of list||[]) {
+        if (!li) continue;
+        try { if (li.guid) byGuid.set(li.guid,li); } catch(e) {}
+        let ch=null;
+        try { ch=li.children; } catch(e) {}
+        if (ch==null||ch===undefined) { try { ch=await li.getChildren(); } catch(e) { ch=[]; } }
+        if (ch&&ch.length) await walk(ch);
+      }
+    }
+    await walk(lineItems||[]);
+    const out=[...byGuid.values()];
+    return out.length?out:(lineItems||[]);
+  }
   function wsRootLineItems(record,lineItems) {
     if (!lineItems||!lineItems.length) return [];
     const rg=record.guid;
-    const roots=lineItems.filter(li=>{ try { const p=li.parent_guid; return p==null||p===undefined||p===rg; } catch(e) { return true; } });
+    const roots=lineItems.filter(li=>{ try { const p=wsLineParentGuid(li); return p==null||p===undefined||p===rg; } catch(e) { return true; } });
     return roots.length?roots:lineItems;
   }
   async function wsForEachLineItemDeep(lineItems,visitor,depth,seen) {
@@ -444,10 +478,18 @@
     } catch(e) {}
     return { createdMs,updatedMs };
   }
+  /** Flatten OR / AND / single-segment queries into a list of segment objects (for person, completion, searchByQuery gates). */
+  function wsParsedGroupsFlat(parsed) {
+    if (!parsed) return [];
+    if (parsed.type==='or') return parsed.groups.flatMap(g=>g&&g.type==='all'?g.groups:[g]);
+    if (parsed.type==='all') return parsed.groups;
+    return [parsed];
+  }
   function wsCompletionPreviewFilter(parsed) {
     if (!parsed) return null;
-    if (parsed.type==='or') { for (const g of parsed.groups) { if (g.isCompleted!==null&&g.isCompleted!==undefined) return g.isCompleted; } return null; }
-    if (parsed.isCompleted!==null&&parsed.isCompleted!==undefined) return parsed.isCompleted;
+    for (const g of wsParsedGroupsFlat(parsed)) {
+      if (g.isCompleted!==null&&g.isCompleted!==undefined) return g.isCompleted;
+    }
     return null;
   }
   /**
@@ -456,7 +498,7 @@
    */
   function wsPersonPreviewFilter(parsed) {
     if (!parsed) return null;
-    const groups = parsed.type==='or' ? parsed.groups : [parsed];
+    const groups = wsParsedGroupsFlat(parsed);
     const personRefs=[], mentionRefs=[];
     for (const g of groups) {
       if (g.personRefs)   personRefs.push(...g.personRefs);
@@ -470,7 +512,8 @@
   function wsSearchByQueryAllowed(parsed) {
     if (!parsed) return false;
     if (parsed.scope&&parsed.scope.underLineGuid) return false;
-    const groups=parsed.type==='or'?parsed.groups:[parsed];
+    if (parsed.type==='all') return false;
+    const groups=wsParsedGroupsFlat(parsed);
     for (const g of groups) {
       if (g.textScope&&g.textScope!=='both') return false;
       if ((g.excludeTerms&&g.excludeTerms.length)||(g.excludePhrases&&g.excludePhrases.length)) return false;
@@ -515,12 +558,15 @@
     return (stripped?prefix+' '+stripped:prefix).trim();
   }
 
-  /** Cursor-local autocomplete context: #tag, bare @person, lowercase ` or ` → OR, or `word:` operators. */
+  /** Cursor-local autocomplete context: #tag, bare @person, ` or `→ OR, ` and `→ AND, or `word:` operators. */
   function wsAcDetectContext(beforeCursor) {
     const b=String(beforeCursor||'');
     if (/\s+OR\s*$/.test(b)) return null;
+    if (/\s+AND\s*$/.test(b)) return null;
     const orM=b.match(/\s+or\s*$/i);
     if (orM) return { type:'or', replaceStart:b.length-orM[0].length, replaceEnd:b.length, prefix:'' };
+    const andM=b.match(/\s+and\s*$/i);
+    if (andM) return { type:'and', replaceStart:b.length-andM[0].length, replaceEnd:b.length, prefix:'' };
     const colonM=b.match(/(?:^|[\s])([\w\-]*)?:$/);
     if (colonM) return { type:'colon', prefix:(colonM[1]||'').toLowerCase(), replaceStart:b.length-colonM[0].length, replaceEnd:b.length };
     const tagM=b.match(/#([^\s#]*)$/);
@@ -566,7 +612,7 @@
     const byGuid=new Map((lineItems||[]).map(li=>[li.guid,li]));
     const children=new Map();
     for (const li of lineItems||[]) {
-      let p=li.parent_guid;
+      let p=wsLineParentGuid(li);
       if (p==null||p===undefined||p===recordGuid) p=recordGuid;
       if (!children.has(p)) children.set(p,[]);
       children.get(p).push(li);
@@ -589,7 +635,7 @@
     if (!anchorLineGuid) return new Set();
     const children=new Map();
     for (const li of lineItems||[]) {
-      let p=li.parent_guid;
+      let p=wsLineParentGuid(li);
       if (p==null||p===undefined||p===recordGuid) p=recordGuid;
       if (!children.has(p)) children.set(p,[]);
       children.get(p).push(li);
@@ -605,6 +651,7 @@
   function wsHasTextualQuery(parsed) {
     if (!parsed) return false;
     if (parsed.type==='or') return parsed.groups.some(g=>((g.terms&&g.terms.length)||(g.phrases&&g.phrases.length)));
+    if (parsed.type==='all') return parsed.groups.some(g=>((g.terms&&g.terms.length)||(g.phrases&&g.phrases.length)));
     return ((parsed.terms&&parsed.terms.length)||(parsed.phrases&&parsed.phrases.length));
   }
   function wsTextMatchesQueryLower(textLower,phrases,terms) {
@@ -617,6 +664,14 @@
     if (!parsed) return true;
     if (parsed.type==='or') {
       return parsed.groups.some(g=>{
+        const ph=g.phrases||[], t=g.terms||[];
+        if (!ph.length&&!t.length) return true;
+        if ((g.textScope||'both')==='title') return false;
+        return wsTextMatchesQueryLower(textLower,ph,t);
+      });
+    }
+    if (parsed.type==='all') {
+      return parsed.groups.every(g=>{
         const ph=g.phrases||[], t=g.terms||[];
         if (!ph.length&&!t.length) return true;
         if ((g.textScope||'both')==='title') return false;
@@ -636,6 +691,14 @@
       return parsed.groups.some(g=>{
         if ((g.textScope||'both')==='title') return false;
         const ph=g.phrases||[], t=g.terms||[];
+        return ph.some(p=>textLower.includes(p))||t.some(x=>textLower.includes(x));
+      });
+    }
+    if (parsed.type==='all') {
+      return parsed.groups.every(g=>{
+        if ((g.textScope||'both')==='title') return false;
+        const ph=g.phrases||[], t=g.terms||[];
+        if (!ph.length&&!t.length) return true;
         return ph.some(p=>textLower.includes(p))||t.some(x=>textLower.includes(x));
       });
     }
@@ -790,12 +853,22 @@
         const empty = this._parseSegment('');
         return empty ? { type: 'and', ...empty, scope } : null;
       }
-      const parts = trimmed.split(/\s+OR\s+/).map(s => s.trim()).filter(Boolean);
-      if (parts.length > 1) {
-        const groups = parts.map(p => this._parseSegment(p)).filter(Boolean);
+      const orParts = trimmed.split(/\s+OR\s+/).map(s => s.trim()).filter(Boolean);
+      if (orParts.length > 1) {
+        const groups = orParts.map(op => this._parseAndOrSingle(op, scope)).filter(Boolean);
         return groups.length ? { type: 'or', groups, scope } : null;
       }
-      const seg = this._parseSegment(trimmed);
+      return this._parseAndOrSingle(orParts[0], scope);
+    }
+
+    /** One top-level OR fragment: either a single segment or `type: 'all'` (AND of segments). */
+    _parseAndOrSingle(trimmed, scope) {
+      const andParts = trimmed.split(/\s+AND\s+/).map(s => s.trim()).filter(Boolean);
+      if (andParts.length > 1) {
+        const groups = andParts.map(p => this._parseSegment(p)).filter(Boolean);
+        return groups.length ? { type: 'all', groups, scope } : null;
+      }
+      const seg = this._parseSegment(andParts[0] || '');
       if (!seg) return wsScopeHas(scope) ? { type: 'and', ...this._parseSegment(''), scope } : null;
       return { type: 'and', ...seg, scope };
     }
@@ -1020,8 +1093,14 @@
     matchesParsedEntryFilters(entry,parsed) {
       if (!parsed) return true;
       if (!this._entryMatchesScope(entry,parsed.scope)) return false;
-      if (parsed.type==='or') return parsed.groups.some(g=>this._entryMatchesGroup(entry,g,parsed));
+      if (parsed.type==='or') return parsed.groups.some(g=>this._entryMatchesOrGroup(entry,g,parsed));
+      if (parsed.type==='all') return parsed.groups.every(g=>this._entryMatchesGroup(entry,g,parsed));
       return this._entryMatchesGroup(entry,parsed,parsed);
+    }
+
+    _entryMatchesOrGroup(entry,g,parsed) {
+      if (g&&g.type==='all') return g.groups.every(g2=>this._entryMatchesGroup(entry,g2,parsed));
+      return this._entryMatchesGroup(entry,g,parsed);
     }
 
     _entryMatchesScope(entry,scope) {
@@ -1141,14 +1220,45 @@
       if (parsed.type==='or') {
         const nameSeen=new Map(),bodySeen=new Map();
         for (const group of parsed.groups) {
-          const {nameMatches,bodyMatches}=this._filterGroupWithBody(group,limit,parsed);
+          const {nameMatches,bodyMatches}=this._filterOrGroupWithBody(group,limit,parsed);
           for (const e of nameMatches) { if (!nameSeen.has(e.guid)) nameSeen.set(e.guid,e); }
           for (const e of bodyMatches) { if (!nameSeen.has(e.guid)&&!bodySeen.has(e.guid)) bodySeen.set(e.guid,e); }
           if (nameSeen.size+bodySeen.size>=limit) break;
         }
         return {nameMatches:[...nameSeen.values()],bodyMatches:[...bodySeen.values()]};
       }
+      if (parsed.type==='all') return this._filterAllWithBody(parsed,limit,parsed);
       return this._filterGroupWithBody(parsed,limit,parsed);
+    }
+
+    _filterOrGroupWithBody(group,limit,parsed) {
+      if (group&&group.type==='all') return this._filterAllWithBody(group,limit,parsed);
+      return this._filterGroupWithBody(group,limit,parsed);
+    }
+
+    /** Intersection of matches for each AND conjunct (full scan per conjunct; then intersect guids). */
+    _filterAllWithBody(andParsed,limit,outerParsed) {
+      const INNER=Number.MAX_SAFE_INTEGER;
+      const partResults=andParsed.groups.map(g=>this._filterGroupWithBody(g,INNER,outerParsed));
+      if (!partResults.length) return {nameMatches:[],bodyMatches:[]};
+      let guidSet=null;
+      for (const pr of partResults) {
+        const s=new Set();
+        for (const e of pr.nameMatches) s.add(e.guid);
+        for (const e of pr.bodyMatches) s.add(e.guid);
+        if (guidSet===null) guidSet=s;
+        else guidSet=new Set([...guidSet].filter(g=>s.has(g)));
+        if (!guidSet.size) return {nameMatches:[],bodyMatches:[]};
+      }
+      const wantsBody=andParsed.groups.some(g=>{
+        const hasText=!!((g.phrases&&g.phrases.length)||(g.terms&&g.terms.length));
+        return hasText&&(g.textScope||'both')!=='title';
+      });
+      const entries=[...guidSet].map(g=>this._entries.get(g)).filter(Boolean);
+      const sorted=wsSortSearchResultsByCollectionTitle(entries);
+      const truncated=sorted.slice(0,limit);
+      if (wantsBody) return {nameMatches:[],bodyMatches:truncated.map(e=>({...e,_bodyMatch:true}))};
+      return {nameMatches:truncated,bodyMatches:[]};
     }
 
     _filterGroupWithBody(group,limit,parsed) {
@@ -1377,6 +1487,8 @@
       const items=[];
       if (ctx.type==='or') {
         items.push({ kind:'or', kindLabel:'OR', label:'Use OR (union)', replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:' OR ' });
+      } else if (ctx.type==='and') {
+        items.push({ kind:'and', kindLabel:'AND', label:'Use AND (intersection)', replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:' AND ' });
       } else if (ctx.type==='colon') {
         for (const op of wsAcColonOpsMatch(ctx.prefix)) {
           items.push({ kind:'colon', kindLabel:':', label:op.label, detail:op.detail, replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:op.insert });
@@ -1511,11 +1623,12 @@
           const anchorGuid=previewContext.anchorLineGuid;
           const pq=previewContext.parsed;
           const items=await entry.record.getLineItems(false);
+          const flat=await wsFlattenLineItems(items);
           if (tk!==this._previewLoadToken) return;
           previewEl.innerHTML='';
-          const subtree=wsCollectSubtreeLineGuids(entry.record.guid,items,anchorGuid);
+          const subtree=wsCollectSubtreeLineGuids(entry.record.guid,flat,anchorGuid);
           if (!subtree.size) { previewEl.innerHTML='<div class="ws-preview-empty">Could not resolve heading subtree</div>'; return; }
-          const roots=wsRootLineItems(entry.record,items);
+          const roots=wsRootLineItems(entry.record,flat);
           let found=0;
           await wsForEachLineItemDeep(roots,(li,depth)=>{
             if (!subtree.has(li.guid)) return;
@@ -1695,7 +1808,7 @@
     }
 
     _toPlainQuery(parsed) {
-      const groups=parsed.type==='or'?parsed.groups:[parsed];
+      const groups=wsParsedGroupsFlat(parsed);
       const terms=[],phrases=[];
       for (const g of groups) { if (g.terms) terms.push(...g.terms); if (g.phrases) phrases.push(...g.phrases); }
       return [...phrases.map(p=>`"${p}"`), ...terms].join(' ');
@@ -1717,7 +1830,10 @@
       for (const r of (result.records||[])) processRecord(r);
       for (const line of (result.lines||[])) { try { processRecord(line.record); } catch(e) {} }
       if (!bodyEntries.length) return;
-      this._bodyResults=wsSortSearchResultsByCollectionTitle(bodyEntries);
+      // Merge with index body hits — do not replace; searchByQuery only adds records not already listed.
+      const merged=new Map(this._bodyResults.map(e=>[e.guid,e]));
+      for (const e of bodyEntries) merged.set(e.guid,e);
+      this._bodyResults=wsSortSearchResultsByCollectionTitle([...merged.values()]);
       this._allResults=[...this._nameResults,...this._bodyResults];
       if (this._selectedIdx<0&&this._allResults.length>0) this._selectedIdx=0;
       this._renderResults(); this._updateFooter(this._allResults.length);
@@ -2424,12 +2540,13 @@
     async _refreshBodyForRecord(record) {
       try {
         const items=await record.getLineItems(false);
-        const text=items.map(li=>{ try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join(''); } catch(e){return '';} }).join(' ').slice(0,8000);
+        const flat=await wsFlattenLineItems(items);
+        const text=flat.map(li=>{ try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join(''); } catch(e){return '';} }).join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
         this._index.updateBodyText(record.guid,text);
-        this._index.indexLineSubtrees(record.guid,items);
+        this._index.indexLineSubtrees(record.guid,flat);
         this._index.clearMentionsForRecord(record.guid);
-        this._extractMentions(record.guid,items);
-        const stats=await wsComputeTaskCompletion(record,items);
+        this._extractMentions(record.guid,flat);
+        const stats=await wsComputeTaskCompletion(record,flat);
         this._index.updateTaskCompletion(record.guid,stats);
         this._refreshSearchPanel();
       } catch(e) {}
@@ -2450,20 +2567,21 @@
 
     async _buildBodyIndex() {
       const entries=[...this._index._entries.values()];
-      const BATCH=15, MAX_CHARS=8000;
+      const BATCH=15;
       const extractText=(lineItems)=>lineItems
         .map(li=>{ try { return (li.segments||[]).filter(s=>['text','bold','italic','code','hashtag'].includes(s.type)).map(s=>typeof s.text==='string'?s.text:'').join(''); } catch(e){return '';} })
-        .join(' ').slice(0,MAX_CHARS);
+        .join(' ').slice(0,WS_BODY_INDEX_MAX_CHARS);
 
       for (let i=0;i<entries.length;i+=BATCH) {
         const batch=entries.slice(i,i+BATCH);
         await Promise.all(batch.map(async(entry)=>{
           try {
             const items=await entry.record.getLineItems(false);
-            this._index.updateBodyText(entry.guid,extractText(items));
-            this._index.indexLineSubtrees(entry.guid,items);
-            this._extractMentions(entry.guid,items);
-            const stats=await wsComputeTaskCompletion(entry.record,items);
+            const flat=await wsFlattenLineItems(items);
+            this._index.updateBodyText(entry.guid,extractText(flat));
+            this._index.indexLineSubtrees(entry.guid,flat);
+            this._extractMentions(entry.guid,flat);
+            const stats=await wsComputeTaskCompletion(entry.record,flat);
             this._index.updateTaskCompletion(entry.guid,stats);
           } catch(e) {}
         }));

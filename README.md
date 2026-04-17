@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.1.0**
+**Version 1.1.1**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.1.0)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It adds **`title:`** / **`body:`** segment prefixes to restrict text terms to the record **name** or **body** (see **Search syntax**). It builds on **v1.0.9** **search autocomplete** (`#` tags, **`@`** people, **`:`** operators, **` or `** → **` OR `**, **⌃Space** saved searches). **Exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, or **`title:`**/**`body:`** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
+**Current release (v1.1.1)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.1** adds **` AND `** (capital **AND**) between segments for **intersection** (e.g. **`title:… AND body:…`**), **autocomplete** after **` and `** → **` AND `** (parallel to **` OR `**), **`under:line:`** fixes (line parent fields, nested line items, preview alignment), **merged** index + **`searchByQuery`** body results (no longer dropping local hits), and a higher per-record **body text** index cap. It includes **v1.1.0** **`title:`** / **`body:`** prefixes, **v1.0.9** **search autocomplete** (`#` / **`@`** / **`:`** / **` or `**→**` OR `** / **⌃Space** saved searches), **exclude phrases**, **created:** / **updated:**, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, **`title:`**/**`body:`**, or **` AND `** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
 
 ## Contents
 
@@ -19,13 +19,13 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **Tags** from the configured record property (default `Tags`) plus `#…` tokens in the record title; property name lookups are **case-insensitive** (e.g. `tags` vs `Tags`).
 - **Path tags** (`#self/work`) and **prefix** include (`#self/`, `#self/*`) for a namespace (`self` or `self/…`).
 - **Exclude tags** with different rules for plain (`-#self`), path (`-#self/foo`), and prefix (`-#self/`, `-#self/*`).
-- **Title + body** matching for non-tag query parts (phrase, terms, `-term`, **exclude phrases** `-"like this"`); body text is filled in **after** a first-pass index, then the current query is re-run. **v1.1.0:** optional **`title:`** or **`body:`** at the start of a segment restricts **text** to the record **name** or **body** only (see **Text** below).
+- **Title + body** matching for non-tag query parts (phrase, terms, `-term`, **exclude phrases** `-"like this"`); body text is filled in **after** a first-pass index, then the current query is re-run. **v1.1.0:** optional **`title:`** or **`body:`** at the start of a segment restricts **text** to the record **name** or **body** only (see **Text** below). **v1.1.1:** **` AND `** between segments requires **all** conjuncts to match (see **AND** below).
 - **Date filters** **`created:`** and **`updated:`** on each record (see below); dates use the **browser’s local timezone** for calendar-day boundaries.
 - **Async** `searchByQuery` for plain terms/phrases when the query has **no** **`-word`** or **`-"phrase"`** text exclusions (otherwise the plugin uses the local index only so exclusions match **`nameLower` + `bodyLower`**). When `searchByQuery` runs, merges respect the same hashtag, completion, **date**, **exclude-phrase**, and person filters as the index.
 - **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **People (@-syntax)** — optional **People collection** and name field in settings; resolve `@name`, `mentions:@name`, `fieldname:@name`, wildcards, and escaped `\@…` (see below). **v1.0.5+:** expand-row previews for **linked properties**, **mention lines**, or **tasks** depending on query (see **Expand preview**). **v1.0.6:** mentions lines show **@Name** badges per matched person (via `people.getDisplayName`); **v1.0.7:** mentions lines use **depth-based indentation** like task preview.
 - **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
-- **Autocomplete:** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**), and **`title:`** / **`body:`**; after **` or `** (lowercase), offers **` OR `** (parser requires capital **`OR`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
+- **Autocomplete:** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**), and **`title:`** / **`body:`**; after **` or `** (lowercase), offers **` OR `**; after **` and `** (lowercase), offers **` AND `** (parser requires capital **`OR`** / **`AND`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
 - **Settings** (gear): included collections, **Hashtag property name**, and **People (@-syntax)** (People collection + optional name property).
 
 ## Search syntax
@@ -42,7 +42,7 @@ Whitespace separates tokens. Matching is **case-insensitive** for text and tags.
 | `-word` | Exclude rows where **title or body** combined contains `word`. |
 | `-"exact phrase"` | Exclude rows where **title + body** combined contain this phrase (substring, case-insensitive). Optional space after `-` is allowed (e.g. `- "foo bar"`). Parsed **before** include phrases so include quotes are not confused with excludes. |
 
-**Title / body only:** At the **start of a segment** (before **`OR`**), **`title:`** or **`body:`** restricts **plain text** terms and **quoted phrases** to the record **name** (`title:`) or **body** (`body:`) only. Tags, **`@`**, dates, **`is:completed`**, etc. still apply to the whole record. **`title:`** / **`body:`** are ignored for **`searchByQuery`** merges (index-only for those queries). With **`under:line:`**, text matching uses the **subtree** only (same as default scoped search); **`title:`** does not apply to individual lines in previews.
+**Title / body only:** At the **start of a segment** (before **`OR`** / **`AND`**), **`title:`** or **`body:`** restricts **plain text** terms and **quoted phrases** to the record **name** (`title:`) or **body** (`body:`) only. Tags, **`@`**, dates, **`is:completed`**, etc. still apply to the whole record. **`title:`** / **`body:`** are ignored for **`searchByQuery`** merges (index-only for those queries). With **`under:line:`**, text matching uses the **subtree** only (same as default scoped search); **`title:`** does not apply to individual lines in previews.
 
 ### Hashtags (include)
 
@@ -64,6 +64,10 @@ Whitespace separates tokens. Matching is **case-insensitive** for text and tags.
 
 `A OR B` splits the query into two groups; each side is parsed as its own segment. Results are merged (union), respecting the same limits. **Person @-filters** work inside each OR segment.
 
+### AND
+
+`A AND B` (capital **`AND`**) requires **every** segment to match the same record (**intersection**). Each side is its own segment (with its own optional **`title:`** / **`body:`** prefix). Example: **`title:1.05 AND body:route`** — title must contain **`1.05`** and the indexed body must contain **`route`**. **` OR `** is split **before** **` AND `**; a branch can be a single segment or an **` AND `** group (e.g. **`title:A AND body:B OR title:C`**). **`searchByQuery`** is not used for pure **` AND `** queries (API cannot express the conjunction faithfully).
+
 ### Task completion
 
 | Pattern | Meaning |
@@ -77,7 +81,7 @@ When the query uses either form, the result row can be **expanded** (chevron) to
 
 ### Search scope (`in:` / `under:`)
 
-Scope tokens are parsed **before** the rest of the query and apply to **all** **`OR`** branches. They use **GUIDs** from Thymer (the picker inserts them). The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
+Scope tokens are parsed **before** the rest of the query and apply to **all** **`OR`** branches and **` AND `** conjuncts. They use **GUIDs** from Thymer (the picker inserts them). The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
 
 | Token | Meaning |
 |--------|---------|
@@ -180,6 +184,14 @@ Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_save
 Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment contains person or mention clauses: person names resolve against `PeopleIndex`; **`mentions:`** uses the reverse mention index; bare **`@name`** backlink filters scan record links via **`linkedRecords()`** and field-specific filters only inspect the named property.
 
 ## Changelog
+
+### 1.1.1
+
+- **` AND `** — Capital **`AND`** between segments parses as **`type: 'all'`**; **`SearchIndex._filterAllWithBody`** intersects matches per conjunct. **`wsParsedGroupsFlat`** flattens **OR** / **AND** for person filters, **`wsSearchByQueryAllowed`**, and **`_toPlainQuery`**. **`searchByQuery`** is disabled for **` AND `** queries.
+- **Autocomplete:** **`wsAcDetectContext`** / **`_refreshAcFromInput`** — trailing **` and `** suggests **` AND `** (like **` or `** → **` OR `**).
+- **`under:line:`** — **`wsLineParentGuid`** (`parent_guid` / `parentGuid`), **`wsFlattenLineItems`** for nested line items; subtree maps and previews use the full outline.
+- **`_searchBody`** — Merges API hits with existing index **body** matches instead of replacing them.
+- **Body index** — **`WS_BODY_INDEX_MAX_CHARS`** (default **100000**) replaces a lower per-record slice for line-derived body text.
 
 ### 1.1.0
 
