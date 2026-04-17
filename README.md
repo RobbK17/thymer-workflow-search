@@ -1,8 +1,10 @@
 # WorkflowSearch
 
-**Version 1.0.7**
+**Version 1.0.8**
 
-A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed. **v1.0.4+** adds a **People** index and **@-syntax**; **v1.0.5** adds **expandable row previews** for person queries (properties, mentions, or mixed) alongside task-completion preview; **v1.0.6–v1.0.7** refine **mentions** previews (multi-person badges, display names, tree depth / indentation matching task preview).
+A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
+
+**Current release (v1.0.8)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It includes **exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`** or **`-"phrase"`** is present (see **Features** and **Changelog §1.0.8**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
 
 ## Contents
 
@@ -17,8 +19,9 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **Tags** from the configured record property (default `Tags`) plus `#…` tokens in the record title; property name lookups are **case-insensitive** (e.g. `tags` vs `Tags`).
 - **Path tags** (`#self/work`) and **prefix** include (`#self/`, `#self/*`) for a namespace (`self` or `self/…`).
 - **Exclude tags** with different rules for plain (`-#self`), path (`-#self/foo`), and prefix (`-#self/`, `-#self/*`).
-- **Title + body** matching for non-tag query parts (phrase, terms, `-term`); body text is filled in **after** a first-pass index, then the current query is re-run.
-- **Async** `searchByQuery` for plain terms/phrases when needed; merges respect the same hashtag, completion, and person filters as the index.
+- **Title + body** matching for non-tag query parts (phrase, terms, `-term`, **exclude phrases** `-"like this"`); body text is filled in **after** a first-pass index, then the current query is re-run.
+- **Date filters** **`created:`** and **`updated:`** on each record (see below); dates use the **browser’s local timezone** for calendar-day boundaries.
+- **Async** `searchByQuery` for plain terms/phrases when the query has **no** **`-word`** or **`-"phrase"`** text exclusions (otherwise the plugin uses the local index only so exclusions match **`nameLower` + `bodyLower`**). When `searchByQuery` runs, merges respect the same hashtag, completion, **date**, **exclude-phrase**, and person filters as the index.
 - **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **People (@-syntax)** — optional **People collection** and name field in settings; resolve `@name`, `mentions:@name`, `fieldname:@name`, wildcards, and escaped `\@…` (see below). **v1.0.5+:** expand-row previews for **linked properties**, **mention lines**, or **tasks** depending on query (see **Expand preview**). **v1.0.6:** mentions lines show **@Name** badges per matched person (via `people.getDisplayName`); **v1.0.7:** mentions lines use **depth-based indentation** like task preview.
 - **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
@@ -36,6 +39,7 @@ Whitespace separates tokens. Matching is **case-insensitive** for text and tags.
 | `word1 word2` | **AND** — all terms must match (combined title + body when body is available). |
 | `"exact phrase"` | Phrase must appear in the same combined text. |
 | `-word` | Exclude rows where **title or body** combined contains `word`. |
+| `-"exact phrase"` | Exclude rows where **title + body** combined contain this phrase (substring, case-insensitive). Optional space after `-` is allowed (e.g. `- "foo bar"`). Parsed **before** include phrases so include quotes are not confused with excludes. |
 
 ### Hashtags (include)
 
@@ -68,6 +72,22 @@ Completion is derived from the full document tree (nested tasks under lists/bloc
 
 When the query uses either form, the result row can be **expanded** (chevron) to load a **preview** of matching task lines only, with indentation by nesting depth.
 
+### Date filters (`created:` / `updated:`)
+
+Each record supplies **created** and **updated** times when the Thymer `Record` exposes them (see **Indexing behavior**). Filters apply to the **whole record**, not individual line items. Multiple clauses on the same field are **intersected** (narrowed). **Invalid** date tokens are ignored for filtering (the token is still removed from the query string).
+
+| Pattern | Meaning |
+|--------|---------|
+| `created:YYYY-MM-DD` | Record’s **created** time falls on that **calendar day** (local: midnight through end of day). |
+| `updated:YYYY-MM-DD` | Record’s **updated** time falls on that calendar day (local). |
+| `created:>=YYYY-MM-DD` | Created on or after the **start** of that day (local). |
+| `updated:<=YYYY-MM-DD` | Updated on or before the **end** of that day (local). |
+| `created:>YYYY-MM-DD` | Created **after** that calendar day (first instant after its end). |
+| `updated:<YYYY-MM-DD` | Updated **before** the **start** of that calendar day. |
+| `created:YYYY-MM-DD..YYYY-MM-DD` | **Inclusive** range (start of first day through end of second day, local). Same shape for **`updated:`**. |
+
+If a record has **no** usable timestamp for a field you filter on, it **does not** match that date predicate.
+
 ### Expand preview (chevron on results)
 
 A **chevron** appears on each result row when the query includes **task completion** (`is:completed` / `-is:completed`) **or** resolvable **person-related** syntax: bare **`@…`**, **`fieldname:@…`**, or **`mentions:`** (People index must resolve at least one person GUID). Tooltips reflect context (“Preview matching tasks”, “Preview mentions”, “Preview linked properties”).
@@ -96,6 +116,7 @@ Requires **People (@-syntax)** to be configured (People collection, optional nam
 | `fieldname:@name` | Only the property **`fieldname`** must link to that person (exact name match; optional `*` on the name for prefix). |
 | `mentions:@name` | Records whose body contains an **inline mention/ref** to that person. After the body index finishes, this uses a **reverse index** (`personGuid → record guids`) built from `ref` and `mention` segments — fast for `mentions:`. |
 | `\@token` | **Escaped** `@` — searches for the literal text `@token` in title/body instead of a person filter. |
+| `?token` | **Escaped** `@` — searches for the literal text `?token` in title/body instead of a person filter for Thymer reserved words (i.e. @document, @list). |
 
 Person tokens resolve to person **GUIDs** via the People index (exact name, or prefix when `*` is used). All of the above work inside **`A OR B`** groups.
 
@@ -137,13 +158,22 @@ Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_save
 
 ## Indexing behavior
 
-1. **Fast index**: Records from selected collections are scanned; names, tags, and collection names are stored. The configured **People** collection is read into **`PeopleIndex`** (separate from the main entry map).
+1. **Fast index**: Records from selected collections are scanned; names, tags, and collection names are stored. **Created/updated** times are read via **`wsRecordTimeFields`** (tries `created_at` / `updated_at`, camelCase variants, and `getCreatedAt()` / `getUpdatedAt()` when present). The configured **People** collection is read into **`PeopleIndex`** (separate from the main entry map).
 2. **Body index**: Line items are loaded in batches; body text is appended, **mention/ref segments** update **`SearchIndex._mentionIndex`** (`Map<personGuid, Set<recordGuid>>`), task completion is updated, and the open search panel re-runs the current query when indexing completes.
 3. **Events**: Record create/update/move triggers index updates when the record belongs to an included collection.
 
 Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment contains person or mention clauses: person names resolve against `PeopleIndex`; **`mentions:`** uses the reverse mention index; bare **`@name`** backlink filters scan record links via **`linkedRecords()`** and field-specific filters only inspect the named property.
 
 ## Changelog
+
+### 1.0.8
+
+This section lists everything shipped under the **1.0.8** version line in **`plugin.js`**, **`plugin.json`**, and this README (including behavior that was briefly tagged **v1.0.9** / **v1.1.0** in earlier docs—**no separate changelog headings**).
+
+- **Exclude phrases:** Query syntax **`-"…"`** (optional space after `-`). Excludes records whose **combined** title + body contain the phrase (case-insensitive substring). Parsed before include quotes so `- "foo"` and `"foo"` do not clash.
+- **Date filters:** **`created:`** and **`updated:`** with values **`YYYY-MM-DD`**, **`>=` / `<=` / `>` / `<`**, or **`start..end`** ranges; calendar boundaries use the **browser local** timezone. Stored per index entry from the record API; records **missing** a timestamp **fail** predicates that require that field. Multiple clauses on the same field are **intersected**. **`SearchIndex._entryMatchesGroup`** and **`_filterGroupWithBody`** apply the same rules for the index and for **`searchByQuery`** merge filtering.
+- **`searchByQuery` skip (formerly v1.0.9):** **`wsSearchByQueryAllowed`** — if any OR-segment includes **`-term`** or **`-"phrase"`**, the plugin does **not** call **`data.searchByQuery`**. Results come only from the local index so text exclusions stay consistent with **`nameLower` + `bodyLower`** (e.g. **`dog -"dog"`** is not filled with API hits that lack that substring). Tag-only / person-only / date-only queries without text exclusions still use the API when **`plainQuery`** is non-empty.
+- **Version alignment (formerly v1.1.0):** **`plugin.js`** file header, **`WS_VERSION`**, **`plugin.json`** `custom.version`, and **README** top version are kept in sync; that pass had **no** additional behavior beyond documenting the above.
 
 ### 1.0.7
 

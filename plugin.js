@@ -1,6 +1,6 @@
 /**
  * WorkflowSearch — AppPlugin
- * Version 1.0.7
+ * Version 1.0.8
  *
  * Persistent panel-based Workflowy-style search across Thymer collections.
  *
@@ -19,6 +19,8 @@
  *   \@name          → literal text search for "@name" (escaped)
  *   fieldname:@name → records where property "fieldname" links to person "name"
  *   mentions:@name  → records containing an inline ref to person "name"
+ *   -"phrase"       → exclude records whose title+body contain phrase
+ *   created: / updated: → filter by record date (local calendar day; see README)
  *
  * Keyboard:
  *   ↑ ↓             → navigate results
@@ -27,7 +29,7 @@
  *   ⌘S / Ctrl+S     → save current search
  */
 
-const WS_VERSION = '1.0.7';
+const WS_VERSION = '1.0.8';
 
 const WS_CSS = `
   .ws-root {
@@ -99,6 +101,12 @@ const WS_CSS = `
   .ws-status-dot { width: 5px; height: 5px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
   .ws-status-dot.ws-building { background: #ff9800; animation: ws-pulse 1.2s ease-in-out infinite; }
   @keyframes ws-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .ws-people-warn {
+    padding: 8px 14px; font-size: 11px; line-height: 1.45; color: #e8c090;
+    background: rgba(255, 152, 0, 0.09); border-bottom: 1px solid rgba(255, 152, 0, 0.14);
+    flex-shrink: 0;
+  }
+  .ws-people-warn.ws-hidden { display: none; }
   .ws-body { flex: 1; overflow-y: auto; min-height: 0; padding: 2px 0 8px; }
   .ws-empty { padding: 32px 16px; text-align: center; color: #8a7e6a; font-size: 12px; line-height: 1.7; }
   .ws-empty-icon { margin-bottom: 10px; opacity: 0.65; }
@@ -255,6 +263,108 @@ function wsMatchesCompletionFilter(entry,isCompleted) {
   if (isCompleted===false) return entry.hasOpenTask===true;
   return true;
 }
+
+/** YYYY-MM-DD → local start-of-day ms */
+function wsDayStartMs(ymd) {
+  const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||'').trim());
+  if (!m) return null;
+  const y=+m[1],mo=+m[2],d=+m[3];
+  if (mo<1||mo>12||d<1||d>31) return null;
+  const t=new Date(y,mo-1,d,0,0,0,0).getTime();
+  return isNaN(t)?null:t;
+}
+/** YYYY-MM-DD → local end-of-day ms */
+function wsDayEndMs(ymd) {
+  const m=/^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||'').trim());
+  if (!m) return null;
+  const y=+m[1],mo=+m[2],d=+m[3];
+  if (mo<1||mo>12||d<1||d>31) return null;
+  const t=new Date(y,mo-1,d,23,59,59,999).getTime();
+  return isNaN(t)?null:t;
+}
+/**
+ * Parse one created:/updated: value token.
+ * Supports: YYYY-MM-DD, >= <= > < prefixes, YYYY-MM-DD..YYYY-MM-DD ranges.
+ * Returns { minMs, maxMs } with null = unbounded, or null if invalid.
+ */
+function wsParseDateClauseValue(val) {
+  const v=String(val||'').trim();
+  const ymdRe=/^\d{4}-\d{2}-\d{2}$/;
+  const range=v.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+  if (range) {
+    if (!ymdRe.test(range[1])||!ymdRe.test(range[2])) return null;
+    const minMs=wsDayStartMs(range[1]),maxMs=wsDayEndMs(range[2]);
+    if (minMs==null||maxMs==null||minMs>maxMs) return null;
+    return { minMs,maxMs };
+  }
+  if (v.startsWith('>=')&&ymdRe.test(v.slice(2))) {
+    const minMs=wsDayStartMs(v.slice(2));
+    return minMs==null?null:{ minMs,maxMs:null };
+  }
+  if (v.startsWith('<=')&&ymdRe.test(v.slice(2))) {
+    const maxMs=wsDayEndMs(v.slice(2));
+    return maxMs==null?null:{ minMs:null,maxMs };
+  }
+  if (v.startsWith('>')&&!v.startsWith('>=')&&ymdRe.test(v.slice(1))) {
+    const end=wsDayEndMs(v.slice(1));
+    return end==null?null:{ minMs:end+1,maxMs:null };
+  }
+  if (v.startsWith('<')&&!v.startsWith('<=')&&ymdRe.test(v.slice(1))) {
+    const start=wsDayStartMs(v.slice(1));
+    return start==null?null:{ minMs:null,maxMs:start-1 };
+  }
+  if (ymdRe.test(v)) {
+    const minMs=wsDayStartMs(v),maxMs=wsDayEndMs(v);
+    return minMs==null||maxMs==null?null:{ minMs,maxMs };
+  }
+  return null;
+}
+function wsIntersectDateInterval(a,b) {
+  if (!a) return b;
+  if (!b) return a;
+  const minMs=Math.max(a.minMs??-Infinity,b.minMs??-Infinity);
+  const maxMs=Math.min(a.maxMs??Infinity,b.maxMs??Infinity);
+  if (minMs>maxMs) return { empty:true };
+  return { minMs:minMs===-Infinity?null:minMs,maxMs:maxMs===Infinity?null:maxMs };
+}
+function wsTsInRange(t,intv) {
+  if (!intv||intv.empty) return true;
+  if (t==null||typeof t!=='number'||isNaN(t)) return false;
+  if (intv.minMs!=null&&t<intv.minMs) return false;
+  if (intv.maxMs!=null&&t>intv.maxMs) return false;
+  return true;
+}
+/** @param {{created?:object|null,updated?:object|null}} df */
+function wsEntryMatchesDateFilters(entry,df) {
+  if (!df) return true;
+  if (df.created?.empty||df.updated?.empty) return false;
+  if (df.created&&!wsTsInRange(entry.createdMs,df.created)) return false;
+  if (df.updated&&!wsTsInRange(entry.updatedMs,df.updated)) return false;
+  return true;
+}
+function wsRecordTimeFields(record) {
+  let createdMs=null,updatedMs=null;
+  const num=(v)=>{
+    if (v==null||v==='') return null;
+    if (typeof v==='number'&&!isNaN(v)) return v;
+    if (v instanceof Date) return v.getTime();
+    if (typeof v==='string') { const p=Date.parse(v); return isNaN(p)?null:p; }
+    return null;
+  };
+  try {
+    for (const k of ['created_at','createdAt','created']) {
+      if (record[k]!==undefined) { createdMs=num(record[k]); if (createdMs!=null) break; }
+    }
+    if (createdMs==null&&typeof record.getCreatedAt==='function') createdMs=num(record.getCreatedAt());
+  } catch(e) {}
+  try {
+    for (const k of ['updated_at','updatedAt','updated']) {
+      if (record[k]!==undefined) { updatedMs=num(record[k]); if (updatedMs!=null) break; }
+    }
+    if (updatedMs==null&&typeof record.getUpdatedAt==='function') updatedMs=num(record.getUpdatedAt());
+  } catch(e) {}
+  return { createdMs,updatedMs };
+}
 function wsCompletionPreviewFilter(parsed) {
   if (!parsed) return null;
   if (parsed.type==='or') { for (const g of parsed.groups) { if (g.isCompleted!==null&&g.isCompleted!==undefined) return g.isCompleted; } return null; }
@@ -275,6 +385,16 @@ function wsPersonPreviewFilter(parsed) {
   }
   if (!personRefs.length && !mentionRefs.length) return null;
   return { personRefs, mentionRefs };
+}
+
+/** When false, skip `searchByQuery`: exclusions apply only to indexed title+body; the API cannot express them. */
+function wsSearchByQueryAllowed(parsed) {
+  if (!parsed) return false;
+  const groups=parsed.type==='or'?parsed.groups:[parsed];
+  for (const g of groups) {
+    if ((g.excludeTerms&&g.excludeTerms.length)||(g.excludePhrases&&g.excludePhrases.length)) return false;
+  }
+  return true;
 }
 
 function wsSortSearchResultsByCollectionTitle(entries) {
@@ -390,6 +510,16 @@ class QueryParser {
     if (/\-is:completed\b/.test(s))  { isCompleted=false; s=s.replace(/-is:completed\b/g,' '); }
     if (/\bis:completed\b/.test(s))  { isCompleted=true;  s=s.replace(/\bis:completed\b/g,' '); }
 
+    // created: / updated: (date filters; values stripped before text parse)
+    const dateFilters={ created:null,updated:null };
+    for (const kind of ['created','updated']) {
+      for (const m of s.matchAll(new RegExp(`\\b${kind}:(\\S+)`,'gi'))) {
+        const intv=wsParseDateClauseValue(m[1]);
+        if (intv) dateFilters[kind]=wsIntersectDateInterval(dateFilters[kind],intv);
+      }
+      s=s.replace(new RegExp(`\\b${kind}:\\S+`,'gi'),' ');
+    }
+
     // mentions:@name or mentions:@name*
     for (const m of [...s.matchAll(/\bmentions:@(\S+)/g)]) {
       const tok=m[1]; const wc=tok.endsWith('*');
@@ -416,7 +546,12 @@ class QueryParser {
     }
     s=s.replace(/@\S+/g,' ');
 
-    // quoted phrases
+    // excluded quoted phrases (before include quotes)
+    const excludePhrases=[];
+    for (const m of s.matchAll(/-\s*"([^"]+)"/g)) excludePhrases.push(m[1].toLowerCase());
+    s=s.replace(/-\s*"[^"]+"/g,' ');
+
+    // quoted phrases (include)
     for (const m of [...s.matchAll(/"([^"]+)"/g)]) phrases.push(m[1].toLowerCase());
     s=s.replace(/"[^"]+"/g,' ');
 
@@ -433,12 +568,13 @@ class QueryParser {
     // bare terms — include escaped literals as plain terms
     const terms=[...s.split(/\s+/).map(t=>t.toLowerCase()).filter(Boolean), ...literalAt];
 
+    const hasDate=(dateFilters.created!=null&&!dateFilters.created.empty)||(dateFilters.updated!=null&&!dateFilters.updated.empty);
     const isEmpty=!includeTags.length&&!excludeTags.length&&!phrases.length&&
-      !excludeTerms.length&&!terms.length&&isCompleted===null&&
-      !personRefs.length&&!mentionRefs.length;
+      !excludeTerms.length&&!excludePhrases.length&&!terms.length&&isCompleted===null&&
+      !personRefs.length&&!mentionRefs.length&&!hasDate;
     if (isEmpty) return null;
 
-    return { includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted,personRefs,mentionRefs };
+    return { includeTags,excludeTags,phrases,excludePhrases,excludeTerms,terms,isCompleted,personRefs,mentionRefs,dateFilters };
   }
 }
 
@@ -498,7 +634,8 @@ class SearchIndex {
     const name=record.getName()||'';
     for (const m of [...name.matchAll(/#([^\s#]+)/g)]) { const t=wsNormalizeTagToken(m[1]); if (!tags.includes(t)) tags.push(t); }
     const displayName=name.replace(/#[^\s#]+/g,'').replace(/\s{2,}/g,' ').trim()||name;
-    return { guid:record.guid,name,displayName,nameLower:name.toLowerCase(),tags,collectionGuid,collectionName,record };
+    const times=wsRecordTimeFields(record);
+    return { guid:record.guid,name,displayName,nameLower:name.toLowerCase(),tags,collectionGuid,collectionName,record,createdMs:times.createdMs,updatedMs:times.updatedMs };
   }
 
   /** Add person mention (ref segment) during body indexing. */
@@ -534,6 +671,13 @@ class SearchIndex {
     if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) return false;
     if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) return false;
     if (!wsMatchesCompletionFilter(entry,group.isCompleted)) return false;
+    const df=group.dateFilters;
+    if (!wsEntryMatchesDateFilters(entry,df||null)) return false;
+    const excludeTerms=group.excludeTerms||[],excludePhrases=group.excludePhrases||[];
+    const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
+    const combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
+    if (excludeTerms.some(t=>combined.includes(t))) return false;
+    if (excludePhrases.some(p=>combined.includes(p))) return false;
     return true;
   }
 
@@ -623,8 +767,10 @@ class SearchIndex {
   }
 
   _filterGroupWithBody(group,limit) {
-    const {includeTags,excludeTags,phrases,excludeTerms,terms,isCompleted=null}=group;
+    const {includeTags,excludeTags,phrases,excludeTerms,excludePhrases=[],terms,isCompleted=null,dateFilters}=group;
     const nameMatches=[],bodyMatches=[];
+
+    if (dateFilters?.created?.empty||dateFilters?.updated?.empty) return {nameMatches,bodyMatches};
 
     // Resolve person filters to an allowed set (null = no restriction)
     const personAllowed = this._resolvePersonFilters(group);
@@ -636,10 +782,12 @@ class SearchIndex {
       if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) continue;
       if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) continue;
       if (!wsMatchesCompletionFilter(entry,isCompleted)) continue;
+      if (!wsEntryMatchesDateFilters(entry,dateFilters||null)) continue;
 
       const bodyText=entry.bodyLower!==undefined?entry.bodyLower:'';
       const combined=bodyText?entry.nameLower+' '+bodyText:entry.nameLower;
       if (excludeTerms.some(t=>combined.includes(t))) continue;
+      if (excludePhrases.some(p=>combined.includes(p))) continue;
 
       const hasTextual=!!(phrases.length||terms.length);
 
@@ -694,6 +842,7 @@ class SearchPanel {
     root.appendChild(this._buildHeader());
     const savedRow=document.createElement('div'); savedRow.className='ws-saved-row'; root.appendChild(savedRow);
     const statusBar=document.createElement('div'); statusBar.className='ws-status'; root.appendChild(statusBar);
+    const peopleWarn=document.createElement('div'); peopleWarn.className='ws-people-warn ws-hidden'; root.appendChild(peopleWarn);
     const body=document.createElement('div'); body.className='ws-body'; root.appendChild(body);
     root.appendChild(this._buildFooter());
     root.addEventListener('keydown',(e)=>e.stopPropagation());
@@ -718,6 +867,7 @@ class SearchPanel {
   refreshStatus() {
     this._updateStatus();
     if (!this._query&&!this._configMode) this._renderEmptyState();
+    else if (!this._configMode) this._syncPeopleDisabledWarning();
   }
 
   _buildHeader() {
@@ -784,7 +934,7 @@ class SearchPanel {
     const doNav=async(panel)=>{
       panel.navigateTo({type:'edit_panel',rootId:entry.record.guid,workspaceGuid:this._plugin.getWorkspaceGuid()});
       this._plugin.ui.setActivePanel(panel);
-      const plainQuery=this._toPlainQuery(this._parser.parse(this._query)||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],isCompleted:null,personRefs:[],mentionRefs:[]});
+      const plainQuery=this._toPlainQuery(this._parser.parse(this._query)||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],excludePhrases:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null}});
       if (!plainQuery) return;
       try {
         const lineItems=await Promise.race([entry.record.getLineItems(false),new Promise(r=>setTimeout(()=>r([]),3000))]);
@@ -923,23 +1073,43 @@ class SearchPanel {
     this._root?.querySelectorAll('.ws-result-wrap').forEach(wrap=>{ const entry=this._allResults[parseInt(wrap.dataset.idx,10)]; wrap.classList.toggle('ws-opened',!!(entry&&entry.guid===this._openedGuid)); });
   }
 
+  /** Shown when the query uses @-syntax but People collection is not configured in settings. */
+  _syncPeopleDisabledWarning() {
+    const el=this._root?.querySelector('.ws-people-warn');
+    if (!el) return;
+    if (this._configMode) { el.classList.add('ws-hidden'); el.textContent=''; return; }
+    const parsed=this._parser.parse(this._query||'');
+    const needPeopleSyntax=!!parsed && !this._index._people.isConfigured() && wsPersonPreviewFilter(parsed);
+    if (needPeopleSyntax) {
+      el.classList.remove('ws-hidden');
+      el.textContent='People search (@name, field:@name, mentions:@name) needs a People collection. Open settings (gear icon) and choose a People collection.';
+    } else {
+      el.classList.add('ws-hidden');
+      el.textContent='';
+    }
+  }
+
   _search(query) {
     if (this._configMode) return;
     this._query=query; this._expandedGuid=null; this._previewLoadToken++;
     const token=++this._searchToken;
-    const parsed=this._parser.parse(query);
-    if (!parsed) {
-      this._nameResults=[]; this._bodyResults=[]; this._allResults=[]; this._selectedIdx=-1;
-      this._renderEmptyState(); this._updateFooter(null); return;
+    try {
+      const parsed=this._parser.parse(query);
+      if (!parsed) {
+        this._nameResults=[]; this._bodyResults=[]; this._allResults=[]; this._selectedIdx=-1;
+        this._renderEmptyState(); this._updateFooter(null); return;
+      }
+      const {nameMatches,bodyMatches}=this._index.queryWithBody(parsed);
+      this._nameResults=wsSortSearchResultsByCollectionTitle(nameMatches);
+      this._bodyResults=wsSortSearchResultsByCollectionTitle(bodyMatches);
+      this._allResults=[...this._nameResults,...this._bodyResults];
+      this._selectedIdx=this._allResults.length>0?0:-1;
+      this._renderResults(); this._updateFooter(this._allResults.length);
+      const plainQuery=this._toPlainQuery(parsed);
+      if (plainQuery&&wsSearchByQueryAllowed(parsed)) void this._searchBody(plainQuery,token,parsed);
+    } finally {
+      this._syncPeopleDisabledWarning();
     }
-    const {nameMatches,bodyMatches}=this._index.queryWithBody(parsed);
-    this._nameResults=wsSortSearchResultsByCollectionTitle(nameMatches);
-    this._bodyResults=wsSortSearchResultsByCollectionTitle(bodyMatches);
-    this._allResults=[...this._nameResults,...this._bodyResults];
-    this._selectedIdx=this._allResults.length>0?0:-1;
-    this._renderResults(); this._updateFooter(this._allResults.length);
-    const plainQuery=this._toPlainQuery(parsed);
-    if (plainQuery) void this._searchBody(plainQuery,token,parsed);
   }
 
   _toPlainQuery(parsed) {
@@ -976,10 +1146,11 @@ class SearchPanel {
     if (!body||this._configMode) return;
     const count=this._index.size();
     if (count>0) {
-      body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; A OR B<br>@person &nbsp; @person* &nbsp; field:@person &nbsp; mentions:@person<br>is:completed &nbsp; -is:completed</div></div>`;
+      body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._index.collectionCount()} collection${this._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; -"phrase" &nbsp; A OR B<br>@person &nbsp; @person* &nbsp; field:@person &nbsp; mentions:@person<br>is:completed &nbsp; -is:completed &nbsp; created: &nbsp; updated:</div></div>`;
     } else {
       body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('loader')}</div><div>Building index…</div></div>`;
     }
+    this._syncPeopleDisabledWarning();
   }
 
   _renderResults() {
@@ -1157,6 +1328,7 @@ class SearchPanel {
 
   async _openConfig() {
     this._configMode=true;
+    this._syncPeopleDisabledWarning();
     this._root?.querySelector('.ws-config-btn')?.classList.add('ws-active');
     const body=this._root?.querySelector('.ws-body'); if (!body) return;
     body.innerHTML=`<div class="ws-empty">${wsIcon('loader')} Loading…</div>`;
@@ -1235,6 +1407,7 @@ class SearchPanel {
     this._root?.querySelector('.ws-config-btn')?.classList.remove('ws-active');
     if (this._allResults.length>0) { this._renderResults(); this._updateFooter(this._allResults.length); }
     else { this._renderEmptyState(); this._updateFooter(null); }
+    this._syncPeopleDisabledWarning();
     this._root?.querySelector('.ws-input')?.focus();
   }
 }
