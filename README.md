@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.1.2**
+**Version 1.1.3**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.1.2)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.2** improves **expand-row preview** (correct titles for linked **records** and **collections**, fewer spurious lines, clearer scope badges) and adds **hybrid preview navigation**: **⌘+click** / **Ctrl+click** opens the link target, **right-click** opens a menu (**Open in source note** vs **Open linked record** / **Open link target**), with a matching footer hint. **v1.1.1** added **` AND `** (capital **AND**) between segments for **intersection** (e.g. **`title:… AND body:…`**), **autocomplete** after **` and `** → **` AND `** (parallel to **` OR `**), **`under:line:`** fixes (line parent fields, nested line items, preview alignment), **merged** index + **`searchByQuery`** body results (no longer dropping local hits), and a higher per-record **body text** index cap. It includes **v1.1.0** **`title:`** / **`body:`** prefixes, **v1.0.9** **search autocomplete** (`#` / **`@`** / **`:`** / **` or `**→**` OR `** / **⌃Space** saved searches), **exclude phrases**, **created:** / **updated:**, and **`searchByQuery` skip** when **`-word`**, **`-"phrase"`**, **`title:`**/**`body:`**, or **` AND `** apply (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
+**Current release (v1.1.3)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.3** adds **scope role tokens** in the search field — **`in:record:$wsR`**, **`in:col:$wsC`**, **`under:line:$wsL`** — with **`wsResolveScopeAliases`** / **`_scopeAliasResolved`** for execution, **full GUIDs** on **Save**, and **`wsQueryGuidsToScopeAliases`** when **loading** a saved search so chips restore tokens + map. **v1.1.2** improved **expand-row preview** (linked **record** / **collection** titles, fewer spurious lines, scope **@** badge rules) and **hybrid preview navigation** (**⌘/Ctrl+click** and **right-click** to open link targets, footer hint). **v1.1.1** added **` AND `**, **`under:line:`** fixes, merged **`searchByQuery` +** index body results, and a higher body index cap. It includes **v1.1.0** **`title:`** / **`body:`**, **v1.0.9** autocomplete / **⌃Space** saved searches, **exclude phrases**, dates, and **`searchByQuery` skip** when needed (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable previews; **v1.0.6–v1.0.7** mentions (badges, depth).
 
 ## Contents
 
@@ -81,13 +81,16 @@ When the query uses either form, the result row can be **expanded** (chevron) to
 
 ### Search scope (`in:` / `under:`)
 
-Scope tokens are parsed **before** the rest of the query and apply to **all** **`OR`** branches and **` AND `** conjuncts. They use **GUIDs** from Thymer (the picker inserts them). The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
+Scope tokens are parsed **before** the rest of the query and apply to **all** **`OR`** branches and **` AND `** conjuncts. They use **GUIDs** from Thymer. The **Scope** picker inserts **short role tokens** instead of long IDs so the search bar stays readable; the plugin keeps the **full GUIDs** in memory and substitutes them **before** parsing, searching, and **saving** a search.
 
 | Token | Meaning |
 |--------|---------|
 | `in:col:<guid>` | Only records in this **collection**. |
 | `in:record:<guid>` | Only this **record** (single note). |
 | `under:line:<guid>` | Only this **line’s subtree** (that line and descendants) for **text** matching; implicitly the record that owns the line. |
+| `in:col:$wsC` · `in:record:$wsR` · `under:line:$wsL` | **Alias** form after using the **Scope** picker or when **loading a saved search** (full GUIDs in storage are turned back into **`$ws…`** in the field and **`_scopeAliasResolved`** is filled). **`$wsC`**, **`$wsR`**, **`$wsL`** stand for the collection, note, or line GUID. **Saved searches** still store **expanded** GUIDs in `localStorage`. You can still paste **full** `in:record:…` / `under:line:…` / `in:col:…` tokens manually. |
+
+The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
 
 You can combine **`in:col:`** or **`in:record:`** with **`under:line:`** (e.g. narrow to a collection and then a heading inside a note). Removing chips or editing the query updates scope.
 
@@ -166,7 +169,7 @@ Requires **People (@-syntax)** to be configured (People collection, optional nam
 
 Person tokens resolve to person **GUIDs** via the People index (exact name, or prefix when `*` is used). All of the above work inside **`A OR B`** groups.
 
-**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**), **`underScope`** / **`inRecordScope`** (subtree or whole-note lines). **`_renderResults`** builds **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted). **v1.1.2:** label helpers **`wsResolveGuidTargetTitle`**, **`wsPreviewLineLinkTarget`**; **`SearchPanel`** methods **`_onPreviewLineInteraction`**, **`_navigateToPreviewLinkTarget`**, **`_showPreviewLineMenu`**; scope line UI from **`wsCreateScopePreviewLineDiv`** (click + context menu).
+**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**), **`underScope`** / **`inRecordScope`** (subtree or whole-note lines). **`_renderResults`** builds **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted). **v1.1.2:** label helpers **`wsResolveGuidTargetTitle`**, **`wsPreviewLineLinkTarget`**; **`SearchPanel`** methods **`_onPreviewLineInteraction`**, **`_navigateToPreviewLinkTarget`**, **`_showPreviewLineMenu`**; scope line UI from **`wsCreateScopePreviewLineDiv`** (click + context menu). **v1.1.3:** **`wsResolveScopeAliases`**, **`wsQueryGuidsToScopeAliases`**, **`_scopeAliasResolved`**, **`_queryResolvedForParse()`** (see **Search scope**).
 
 ## Keyboard
 
@@ -211,6 +214,10 @@ Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_save
 Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment contains person or mention clauses: person names resolve against `PeopleIndex`; **`mentions:`** uses the reverse mention index; bare **`@name`** backlink filters scan record links via **`linkedRecords()`** and field-specific filters only inspect the named property.
 
 ## Changelog
+
+### 1.1.3
+
+- **Scope aliases** — Role tokens **`$wsL`**, **`$wsR`**, **`$wsC`** after **`under:line:`** / **`in:record:`** / **`in:col:`** from the Scope picker; **`wsResolveScopeAliases`** expands them before **`QueryParser`** / search; **`_scopeAliasResolved`** holds GUIDs. **Save** stores **full GUIDs**; **saved-search chips** call **`wsQueryGuidsToScopeAliases`** to rewrite stored GUIDs back to tokens and refill the map. Clear search and scope-chip removal keep state consistent.
 
 ### 1.1.2
 

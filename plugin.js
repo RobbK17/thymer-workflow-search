@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.2
+   * Version 1.1.3
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -35,7 +35,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.2';
+  const WS_VERSION = '1.1.3';
 
   /** Line-derived body text indexed per record (beyond this, terms in the tail are not matched locally). */
   const WS_BODY_INDEX_MAX_CHARS = 100000;
@@ -550,20 +550,67 @@
     s=s.replace(/\bin:record:\S+/gi,' ').replace(/\bin:col:\S+/gi,' ').replace(/\bunder:line:\S+/gi,' ');
     return s.replace(/\s+/g,' ').trim();
   }
+  /** Role tokens for display/editing; resolved to real GUIDs before parse/search (see `wsResolveScopeAliases`). */
+  const WS_SCOPE_ALIAS_RECORD = '$wsR';
+  const WS_SCOPE_ALIAS_COL = '$wsC';
+  const WS_SCOPE_ALIAS_LINE = '$wsL';
+
   /** @param {{inRecordGuid?:string|null,inCollectionGuid?:string|null,underLineGuid?:string|null}} scope */
-  function wsFormatScopeTokens(scope) {
+  /** @param {{useAliases?:boolean}} [opts] — if `useAliases`, emit `in:record:$wsR` etc. instead of GUIDs */
+  function wsFormatScopeTokens(scope, opts) {
     if (!scope) return '';
+    const use = opts && opts.useAliases;
     const p=[];
-    if (scope.inRecordGuid) p.push('in:record:'+scope.inRecordGuid);
-    if (scope.inCollectionGuid) p.push('in:col:'+scope.inCollectionGuid);
-    if (scope.underLineGuid) p.push('under:line:'+scope.underLineGuid);
+    if (scope.inRecordGuid) p.push('in:record:'+(use?WS_SCOPE_ALIAS_RECORD:scope.inRecordGuid));
+    if (scope.inCollectionGuid) p.push('in:col:'+(use?WS_SCOPE_ALIAS_COL:scope.inCollectionGuid));
+    if (scope.underLineGuid) p.push('under:line:'+(use?WS_SCOPE_ALIAS_LINE:scope.underLineGuid));
     return p.join(' ');
   }
-  function wsMergeScopeIntoQuery(query, scope) {
+  function wsMergeScopeIntoQuery(query, scope, opts) {
     const stripped=wsStripScopeQuery(query);
-    const prefix=wsFormatScopeTokens(scope);
+    const prefix=wsFormatScopeTokens(scope, opts);
     if (!prefix) return stripped;
     return (stripped?prefix+' '+stripped:prefix).trim();
+  }
+  /**
+   * Replace role tokens with GUIDs from the panel map (set when using the Scope picker).
+   * @param {{underLineGuid?:string|null,inRecordGuid?:string|null,inCollectionGuid?:string|null}} resolved
+   */
+  function wsResolveScopeAliases(raw, resolved) {
+    let s=String(raw||'');
+    const r=resolved||{};
+    if (r.underLineGuid) s=s.replace(new RegExp('\\bunder:line:'+WS_SCOPE_ALIAS_LINE.replace(/\$/g,'\\$')+'\\b','gi'),'under:line:'+r.underLineGuid);
+    if (r.inRecordGuid) s=s.replace(new RegExp('\\bin:record:'+WS_SCOPE_ALIAS_RECORD.replace(/\$/g,'\\$')+'\\b','gi'),'in:record:'+r.inRecordGuid);
+    if (r.inCollectionGuid) s=s.replace(new RegExp('\\bin:col:'+WS_SCOPE_ALIAS_COL.replace(/\$/g,'\\$')+'\\b','gi'),'in:col:'+r.inCollectionGuid);
+    return s;
+  }
+
+  function wsReEsc(str) {
+    return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  /**
+   * When a saved query contains literal GUIDs, convert them to `$wsL` / `$wsR` / `$wsC` and return the map for `_scopeAliasResolved`.
+   * Uses the same last-match semantics as `wsExtractScope` per prefix. Skips if the value is already a role token.
+   */
+  function wsQueryGuidsToScopeAliases(raw) {
+    let s=String(raw||'');
+    const resolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null };
+    const steps=[
+      [/\bunder:line:(\S+)/gi,'underLineGuid',WS_SCOPE_ALIAS_LINE,'under:line:'],
+      [/\bin:record:(\S+)/gi,'inRecordGuid',WS_SCOPE_ALIAS_RECORD,'in:record:'],
+      [/\bin:col:(\S+)/gi,'inCollectionGuid',WS_SCOPE_ALIAS_COL,'in:col:'],
+    ];
+    const tokSet=new Set([WS_SCOPE_ALIAS_LINE,WS_SCOPE_ALIAS_RECORD,WS_SCOPE_ALIAS_COL]);
+    for (const [re,key,tok,prefix] of steps) {
+      const matches=[...s.matchAll(re)];
+      if (!matches.length) continue;
+      const lastCap=matches[matches.length-1][1];
+      if (tokSet.has(lastCap)) continue;
+      resolved[key]=lastCap;
+      const esc=wsReEsc(lastCap);
+      s=s.replace(new RegExp('\\b'+wsReEsc(prefix)+esc+'(?=\\s|$)','gi'),prefix+tok);
+    }
+    return { text:s,resolved };
   }
 
   /** Cursor-local autocomplete context: #tag, bare @person, ` or `→ OR, ` and `→ AND, or `word:` operators. */
@@ -1562,6 +1609,7 @@
       this._selectedIdx=-1; this._openedGuid=null;
       this._query=''; this._debounce=null; this._searchToken=0;
       this._expandedGuid=null; this._previewLoadToken=0;
+      this._scopeAliasResolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null };
       this._previewCtxMenuEl=null; this._previewCtxMenuCleanup=null;
       this._configMode=false; this._saveMode=false; this._root=null;
       this._acOpen=false; this._acItems=[]; this._acSel=0; this._acEl=null;
@@ -1644,7 +1692,7 @@
       });
       input.addEventListener('keydown',(e)=>this._handleKey(e));
       input.addEventListener('click',()=>this._refreshAcFromInput());
-      clearBtn.addEventListener('click',()=>{ this._closeAc(); input.value=''; clearBtn.classList.add('ws-hidden'); saveBtn.disabled=true; this._renderScopeChips(); this._search(''); input.focus(); });
+      clearBtn.addEventListener('click',()=>{ this._closeAc(); input.value=''; clearBtn.classList.add('ws-hidden'); saveBtn.disabled=true; this._scopeAliasResolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null }; this._renderScopeChips(); this._search(''); input.focus(); });
       saveBtn.addEventListener('click',()=>this._openSaveForm());
       header.querySelector('.ws-scope-open-btn')?.addEventListener('click',()=>this._openScopePicker());
       configBtn.addEventListener('click',()=>this._configMode?this._closeConfig():this._openConfig());
@@ -1656,6 +1704,10 @@
       const modHint=wsModClickLinkHint();
       footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">↑↓ results &nbsp;·&nbsp; ⏎ open &nbsp;·&nbsp; ⌘S save &nbsp;·&nbsp; ⌃Space saved &nbsp;·&nbsp; ${modHint} &nbsp;·&nbsp; suggestions: ↑↓ ⏎ Esc</span>`;
       return footer;
+    }
+
+    _queryResolvedForParse() {
+      return wsResolveScopeAliases(this._query, this._scopeAliasResolved);
     }
 
     _closeAc() {
@@ -1802,7 +1854,7 @@
       const doNav=async(panel)=>{
         panel.navigateTo({type:'edit_panel',rootId:entry.record.guid,workspaceGuid:this._plugin.getWorkspaceGuid()});
         this._plugin.ui.setActivePanel(panel);
-        const plainQuery=this._toPlainQuery(this._parser.parse(this._query)||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],excludePhrases:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null}});
+        const plainQuery=this._toPlainQuery(this._parser.parse(this._queryResolvedForParse())||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],excludePhrases:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null}});
         if (!plainQuery) return;
         try {
           const lineItems=await Promise.race([entry.record.getLineItems(false),new Promise(r=>setTimeout(()=>r([]),3000))]);
@@ -2088,7 +2140,7 @@
       const el=this._root?.querySelector('.ws-people-warn');
       if (!el) return;
       if (this._configMode) { el.classList.add('ws-hidden'); el.textContent=''; return; }
-      const parsed=this._parser.parse(this._query||'');
+      const parsed=this._parser.parse(this._queryResolvedForParse()||'');
       const needPeopleSyntax=!!parsed && !this._index._people.isConfigured() && wsPersonPreviewFilter(parsed);
       if (needPeopleSyntax) {
         el.classList.remove('ws-hidden');
@@ -2104,7 +2156,7 @@
       this._query=query; this._expandedGuid=null; this._previewLoadToken++;
       const token=++this._searchToken;
       try {
-        const parsed=this._parser.parse(query);
+        const parsed=this._parser.parse(this._queryResolvedForParse());
         if (!parsed) {
           this._nameResults=[]; this._bodyResults=[]; this._allResults=[]; this._selectedIdx=-1;
           this._renderEmptyState(); this._updateFooter(null); return;
@@ -2170,7 +2222,7 @@
       const body=this._root?.querySelector('.ws-body');
       if (!body) return;
       if (this._allResults.length===0) { body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search-off')}</div><div>No results</div></div>`; return; }
-      const parsed=this._parser.parse(this._query);
+      const parsed=this._parser.parse(this._queryResolvedForParse());
       const wantCompletion=wsCompletionPreviewFilter(parsed);
       const personFilter=wsPersonPreviewFilter(parsed);
       const underGuid=parsed?.scope?.underLineGuid;
@@ -2315,7 +2367,19 @@
       for (const s of searches) {
         const chip=document.createElement('div'); chip.className='ws-chip'; chip.title=s.query;
         const nameEl=document.createElement('span'); nameEl.className='ws-chip-label'; nameEl.textContent=s.name;
-        nameEl.addEventListener('click',()=>{ const input=this._root?.querySelector('.ws-input'); if (input) { input.value=s.query; input.dispatchEvent(new Event('input')); input.focus(); } });
+        nameEl.addEventListener('click',()=>{
+          const input=this._root?.querySelector('.ws-input');
+          if (!input) return;
+          const { text,resolved }=wsQueryGuidsToScopeAliases(s.query);
+          input.value=text;
+          this._scopeAliasResolved={
+            underLineGuid:resolved.underLineGuid||null,
+            inRecordGuid:resolved.inRecordGuid||null,
+            inCollectionGuid:resolved.inCollectionGuid||null,
+          };
+          input.dispatchEvent(new Event('input'));
+          input.focus();
+        });
         const delBtn=document.createElement('button'); delBtn.className='ws-chip-del'; delBtn.title='Remove'; delBtn.innerHTML=wsIcon('x');
         delBtn.addEventListener('click',(e)=>{ e.stopPropagation(); this._persistSavedSearches(this._getSavedSearches().filter(x=>x.id!==s.id)); this._renderSavedChips(); });
         chip.appendChild(nameEl); chip.appendChild(delBtn); row.appendChild(chip);
@@ -2335,7 +2399,7 @@
       const commit=()=>{
         const name=nameInput.value.trim()||this._query.slice(0,40);
         const searches=this._getSavedSearches(); if (searches.length>=12) searches.shift();
-        searches.push({id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`,name,query:this._query});
+        searches.push({id:`${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`,name,query:wsResolveScopeAliases(this._query,this._scopeAliasResolved)});
         this._persistSavedSearches(searches); this._cancelSaveForm(form); this._renderSavedChips();
         this._plugin.ui.addToaster({title:`Search saved: "${name}"`,dismissible:false,autoDestroyTime:2000});
       };
@@ -2460,7 +2524,7 @@
       if (!row) return;
       const input=this._root?.querySelector('.ws-input');
       const q=input?input.value:'';
-      const { scope }=wsExtractScope(q);
+      const { scope }=wsExtractScope(wsResolveScopeAliases(q,this._scopeAliasResolved));
       if (!wsScopeHas(scope)) { row.classList.add('ws-hidden'); row.innerHTML=''; return; }
       row.classList.remove('ws-hidden');
       const parts=[];
@@ -2493,12 +2557,17 @@
     _removeScopePart(part) {
       const input=this._root?.querySelector('.ws-input');
       if (!input) return;
-      const { scope }=wsExtractScope(input.value);
+      const { scope }=wsExtractScope(wsResolveScopeAliases(input.value,this._scopeAliasResolved));
       const next={ inRecordGuid:scope.inRecordGuid||null,inCollectionGuid:scope.inCollectionGuid||null,underLineGuid:scope.underLineGuid||null };
       if (part==='col') next.inCollectionGuid=null;
       else if (part==='rec') next.inRecordGuid=null;
       else if (part==='under') next.underLineGuid=null;
-      input.value=wsMergeScopeIntoQuery(input.value,next);
+      this._scopeAliasResolved={
+        underLineGuid:next.underLineGuid||null,
+        inRecordGuid:next.inRecordGuid||null,
+        inCollectionGuid:next.inCollectionGuid||null,
+      };
+      input.value=wsMergeScopeIntoQuery(input.value,next,{ useAliases:true });
       this._renderScopeChips();
       input.dispatchEvent(new Event('input'));
     }
@@ -2506,7 +2575,12 @@
     _applyScopeSelection(scope) {
       const input=this._root?.querySelector('.ws-input');
       if (!input) return;
-      input.value=wsMergeScopeIntoQuery(input.value,scope);
+      this._scopeAliasResolved={
+        underLineGuid:scope.underLineGuid||null,
+        inRecordGuid:scope.inRecordGuid||null,
+        inCollectionGuid:scope.inCollectionGuid||null,
+      };
+      input.value=wsMergeScopeIntoQuery(input.value,scope,{ useAliases:true });
       this._closeScopePicker();
       this._renderScopeChips();
       input.dispatchEvent(new Event('input'));
