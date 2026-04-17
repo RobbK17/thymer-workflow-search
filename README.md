@@ -113,14 +113,41 @@ A **chevron** appears on each result row when the query includes **`under:line:`
 
 **Priority:** **`under:line:`** → subtree lines; else **`in:record:`** → **whole note** (title hit + matching body lines, or all lines when there are no text terms); else **task** → **mentions** → **property**. (If **`under:`** and **`in:record:`** / **`is:completed`** overlap, **under** preview wins.)
 
+#### Line labels (v1.1.2)
+
+Preview rows prefer **real line text** from segments. When a line is mostly a **link** (outline **ref** / **link** with a target GUID and little or no visible text), the plugin builds a single-line label in order:
+
+1. **Search index** — title for that GUID if the note is indexed.  
+2. **`data.getRecord(guid)`** — workspace note title when the target is a **record** but not in the index.  
+3. **`data.getPluginByGuid(guid)`** — **`getName()`** for **collections** and other linked plugins (collection links use the collection’s **plugin GUID**, which is not a record id, so **`getRecord`** alone is not enough).  
+4. **People** — **`getDisplayName(guid)`** when the target is a person and People is configured.
+
+**Not shown:** raw GUID strings, **`Link · …`** placeholders, or **`· lineId…`** stubs for blank lines. Lines with **no** resolvable label are **omitted** from the list.
+
+#### @ badges in scope previews (v1.1.2)
+
+For **`under:line:`** and **`in:record:`** previews, blue **`@Name`** badges on a line appear only when the query includes a resolvable **person** filter and the badge matches that filter—**not** for every `ref` on the line. That avoids treating **record** or **collection** links as people.
+
+#### Preview navigation (v1.1.2)
+
+Applies to **scope** (`under:line:` / `in:record:`), **task**, and **mentions** line rows (**not** property preview rows, which still open the record only).
+
+| Action | Result |
+|--------|--------|
+| **Click** | Open the **source** note (the search hit) and jump to **this line** with highlight — same as before. |
+| **⌘+click** (macOS) or **Ctrl+click** (Windows/Linux) | If the line has a navigable link target, open that **record** (editor) or **collection / plugin** (collection **overview** view). |
+| **Right-click** | Menu: **Open in source note**; when a link target exists, **Open linked record** or **Open link target** (non-record plugin, e.g. collection). |
+
+The panel **footer** includes a hint: **`⌘+click opens link`** or **`Ctrl+click opens link`** depending on platform.
+
 | Syntax (examples) | Preview content | Click action |
 |---------------------|-----------------|--------------|
-| `@robb` | All **properties** on the record that link to any **queried** person, shown as **`PropName → PersonName`** | Opens the **record** (no line jump) |
+| `@robb` | All **properties** on the record that link to any **queried** person, shown as **`PropName → PersonName`** | Opens the **record** (no line jump; no link-target menu) |
 | `owner:@robb` | Only the **`owner`** property, e.g. **`Owner → Robb`** | Opens the **record** |
-| `mentions:@robb` | All **line items** that contain a **ref/mention** to the queried person | **Navigate to that line** and highlight |
-| Multiple people (e.g. `@robb OR @jane`) | All matched **lines/properties** for **both** people, per rules above | Same as the matching row type (property open vs mention line jump) |
+| `mentions:@robb` | All **line items** that contain a **ref/mention** to the queried person | Default: **source line**; **⌘/Ctrl+click** / **right-click** open **link target** when the line links to a record or collection (**v1.1.2**) |
+| Multiple people (e.g. `@robb OR @jane`) | All matched **lines/properties** for **both** people, per rules above | Same as the matching row type (property open vs mention line jump + **v1.1.2** link navigation on line rows) |
 
-**Mentions preview (v1.0.6–v1.0.7):** Each matching line can reference **multiple** queried people; the preview collects **all** matched person GUIDs per line, then shows a blue **`@Name`** badge for each (names from **`people.getDisplayName(guid)`**, not raw GUIDs). Line text is **capped at 180 characters** to leave room for badges. **v1.0.7:** mention rows use **`wsForEachLineItemDeep`** with **`depth`** (same walker as task preview): **`paddingLeft = 10 + min(depth, 12) × 14`** px, depth **0** = top-level.
+**Mentions preview (v1.0.6–v1.0.7):** Each matching line can reference **multiple** queried people; the preview collects **all** matched person GUIDs per line, then shows a blue **`@Name`** badge for each (names from **`people.getDisplayName(guid)`**, not raw GUIDs). Line text is **capped at 180 characters** to leave room for badges. **v1.0.7:** mention rows use **`wsForEachLineItemDeep`** with **`depth`** (same walker as task preview): **`paddingLeft = 10 + min(depth, 12) × 14`** px, depth **0** = top-level. **v1.1.2:** the same rows support **hybrid navigation** (see table above) when the line also contains links to other records or collections.
 
 **Mixed queries:** If **`mentions:`** and **backlink** (`@name` / `fieldname:@name`) appear together, the UI uses the **mentions** style (line-level preview). **`wsPersonPreviewFilter(parsed)`** collects all `personRefs` and `mentionRefs` across OR groups to decide when person previews apply.
 
@@ -139,7 +166,7 @@ Requires **People (@-syntax)** to be configured (People collection, optional nam
 
 Person tokens resolve to person **GUIDs** via the People index (exact name, or prefix when `*` is used). All of the above work inside **`A OR B`** groups.
 
-**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**). **`_renderResults`** builds **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted).
+**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**), **`underScope`** / **`inRecordScope`** (subtree or whole-note lines). **`_renderResults`** builds **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted). **v1.1.2:** label helpers **`wsResolveGuidTargetTitle`**, **`wsPreviewLineLinkTarget`**; **`SearchPanel`** methods **`_onPreviewLineInteraction`**, **`_navigateToPreviewLinkTarget`**, **`_showPreviewLineMenu`**; scope line UI from **`wsCreateScopePreviewLineDiv`** (click + context menu).
 
 ## Keyboard
 
