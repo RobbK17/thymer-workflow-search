@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.0.8**
+**Version 1.0.9**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.0.8)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It includes **exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`** or **`-"phrase"`** is present (see **Features** and **Changelog §1.0.8**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
+**Current release (v1.0.9)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. It adds **search autocomplete** under the search field (`#` tags, **`@`** people, **`:`** / **`word:`** operators, **` or `** → **` OR `**, **⌃Space** saved searches). **Exclude phrases** (`-"…"`), **created:** / **updated:** date filters, and **`searchByQuery` skip** when **`-word`** or **`-"phrase"`** are present (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable row previews; **v1.0.6–v1.0.7** mentions previews (badges, depth).
 
 ## Contents
 
@@ -25,6 +25,7 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **People (@-syntax)** — optional **People collection** and name field in settings; resolve `@name`, `mentions:@name`, `fieldname:@name`, wildcards, and escaped `\@…` (see below). **v1.0.5+:** expand-row previews for **linked properties**, **mention lines**, or **tasks** depending on query (see **Expand preview**). **v1.0.6:** mentions lines show **@Name** badges per matched person (via `people.getDisplayName`); **v1.0.7:** mentions lines use **depth-based indentation** like task preview.
 - **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
+- **Autocomplete (v1.0.9):** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, and **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**); after **` or `** (lowercase), offers **` OR `** (parser requires capital **`OR`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
 - **Settings** (gear): included collections, **Hashtag property name**, and **People (@-syntax)** (People collection + optional name property).
 
 ## Search syntax
@@ -72,6 +73,18 @@ Completion is derived from the full document tree (nested tasks under lists/bloc
 
 When the query uses either form, the result row can be **expanded** (chevron) to load a **preview** of matching task lines only, with indentation by nesting depth.
 
+### Search scope (`in:` / `under:`)
+
+Scope tokens are parsed **before** the rest of the query and apply to **all** **`OR`** branches. They use **GUIDs** from Thymer (the picker inserts them). The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
+
+| Token | Meaning |
+|--------|---------|
+| `in:col:<guid>` | Only records in this **collection**. |
+| `in:record:<guid>` | Only this **record** (single note). |
+| `under:line:<guid>` | Only this **line’s subtree** (that line and descendants) for **text** matching; implicitly the record that owns the line. |
+
+You can combine **`in:col:`** or **`in:record:`** with **`under:line:`** (e.g. narrow to a collection and then a heading inside a note). Removing chips or editing the query updates scope.
+
 ### Date filters (`created:` / `updated:`)
 
 Each record supplies **created** and **updated** times when the Thymer `Record` exposes them (see **Indexing behavior**). Filters apply to the **whole record**, not individual line items. Multiple clauses on the same field are **intersected** (narrowed). **Invalid** date tokens are ignored for filtering (the token is still removed from the query string).
@@ -90,9 +103,9 @@ If a record has **no** usable timestamp for a field you filter on, it **does not
 
 ### Expand preview (chevron on results)
 
-A **chevron** appears on each result row when the query includes **task completion** (`is:completed` / `-is:completed`) **or** resolvable **person-related** syntax: bare **`@…`**, **`fieldname:@…`**, or **`mentions:`** (People index must resolve at least one person GUID). Tooltips reflect context (“Preview matching tasks”, “Preview mentions”, “Preview linked properties”).
+A **chevron** appears on each result row when the query includes **`under:line:`** or **`in:record:`** with **text** terms/phrases, **task completion** (`is:completed` / `-is:completed`), or resolvable **person-related** syntax: bare **`@…`**, **`fieldname:@…`**, or **`mentions:`** (People index must resolve at least one person GUID). Tooltips reflect context (“Preview lines matching your terms”, “Preview matching lines in this note”, “Preview matching tasks”, “Preview mentions”, “Preview linked properties”).
 
-**Priority:** If the query includes **both** task completion **and** @-syntax, the expanded preview uses **task completion** (matching task lines). The preview type is chosen in this order: **task** → **mentions** → **property**.
+**Priority:** **`under:line:`** + text → subtree lines; else **`in:record:`** + text → **whole note** (title hit + matching body lines); else **task** → **mentions** → **property**. (If **`under:`** and **`in:record:`** / **`is:completed`** overlap, **under** preview wins.)
 
 | Syntax (examples) | Preview content | Click action |
 |---------------------|-----------------|--------------|
@@ -166,14 +179,17 @@ Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment
 
 ## Changelog
 
+### 1.0.9
+
+- **Search autocomplete:** Dropdown under the search field for **`#`…** (tags from the index), **`@`…** at the end of the query (People index, when configured — works after **`mentions:`**, whitespace, etc.; skips **`word@`**-style positions), **`:`** / **`word:`** ( **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`** ), and lowercase **` or `** → insert **` OR `** (union). **⌃Space** lists **saved searches** (same data as **Saved:** chips). **Option A** keyboard: when open, **↑↓** / **Enter** / **Esc** apply to suggestions; **Tab** closes suggestions. **`SearchIndex.getAllTagsSorted`**, **`PeopleIndex.suggestByPrefix`**, **`WS_AC_COLON_OPS`**.
+
 ### 1.0.8
 
-This section lists everything shipped under the **1.0.8** version line in **`plugin.js`**, **`plugin.json`**, and this README (including behavior that was briefly tagged **v1.0.9** / **v1.1.0** in earlier docs—**no separate changelog headings**).
+This section lists features first released under the **1.0.8** docs line (exclude phrases, dates, **`searchByQuery` skip**).
 
 - **Exclude phrases:** Query syntax **`-"…"`** (optional space after `-`). Excludes records whose **combined** title + body contain the phrase (case-insensitive substring). Parsed before include quotes so `- "foo"` and `"foo"` do not clash.
 - **Date filters:** **`created:`** and **`updated:`** with values **`YYYY-MM-DD`**, **`>=` / `<=` / `>` / `<`**, or **`start..end`** ranges; calendar boundaries use the **browser local** timezone. Stored per index entry from the record API; records **missing** a timestamp **fail** predicates that require that field. Multiple clauses on the same field are **intersected**. **`SearchIndex._entryMatchesGroup`** and **`_filterGroupWithBody`** apply the same rules for the index and for **`searchByQuery`** merge filtering.
-- **`searchByQuery` skip (formerly v1.0.9):** **`wsSearchByQueryAllowed`** — if any OR-segment includes **`-term`** or **`-"phrase"`**, the plugin does **not** call **`data.searchByQuery`**. Results come only from the local index so text exclusions stay consistent with **`nameLower` + `bodyLower`** (e.g. **`dog -"dog"`** is not filled with API hits that lack that substring). Tag-only / person-only / date-only queries without text exclusions still use the API when **`plainQuery`** is non-empty.
-- **Version alignment (formerly v1.1.0):** **`plugin.js`** file header, **`WS_VERSION`**, **`plugin.json`** `custom.version`, and **README** top version are kept in sync; that pass had **no** additional behavior beyond documenting the above.
+- **`searchByQuery` skip:** **`wsSearchByQueryAllowed`** — if any OR-segment includes **`-term`** or **`-"phrase"`**, the plugin does **not** call **`data.searchByQuery`**. Results come only from the local index so text exclusions stay consistent with **`nameLower` + `bodyLower`** (e.g. **`dog -"dog"`** is not filled with API hits that lack that substring). Tag-only / person-only / date-only queries without text exclusions still use the API when **`plainQuery`** is non-empty.
 
 ### 1.0.7
 
