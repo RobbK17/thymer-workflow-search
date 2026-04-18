@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.4
+   * Version 1.1.5
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -35,11 +35,13 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.4';
+  const WS_VERSION = '1.1.5';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
   const WS_LS_SAVED = 'ws_saved_searches';
+  /** Theme is a pure UI preference — stored locally so changing it doesn't trigger `saveConfiguration` (which reloads the plugin). */
+  const WS_LS_THEME = 'ws_ui_theme';
   /** `plugin.json` → `custom` — persisted server-side per workspace. */
   const WS_CUSTOM_NS = 'workflowSearch';
 
@@ -56,16 +58,38 @@
       if (!x || typeof x !== 'object') return null;
       return { id: String(x.id ?? ''), name: String(x.name ?? ''), query: String(x.query ?? '') };
     }).filter(Boolean);
+    let uiTheme = r.uiTheme;
+    if (uiTheme !== 'dark' && uiTheme !== 'light' && uiTheme !== 'system') uiTheme = 'system';
     return {
       includedCollectionIds: Array.isArray(r.includedCollectionIds) ? r.includedCollectionIds : [],
       tagPropName: typeof r.tagPropName === 'string' && r.tagPropName.trim() ? r.tagPropName.trim() : 'Tags',
       peopleCollectionGuid: typeof r.peopleCollectionGuid === 'string' ? r.peopleCollectionGuid : '',
       peopleNameProp: typeof r.peopleNameProp === 'string' ? r.peopleNameProp : '',
       savedSearches: savedList,
+      uiTheme,
     };
   }
 
-  /** Canonical blob for `custom[workflowSearch]` plus legacy LS split (config vs saved array). */
+  /** `data.getAllCollections()` should return an array per the SDK; keep this thin and log anything unexpected instead of coercing to `[]`. */
+  function wsCoerceCollectionArray(raw, where) {
+    if (Array.isArray(raw)) return raw;
+    if (raw && typeof raw === 'object') {
+      if (Array.isArray(raw.collections)) return raw.collections;
+      if (typeof raw[Symbol.iterator] === 'function') {
+        try { return [...raw]; } catch (e) {}
+      }
+    }
+    console.warn('[WorkflowSearch] getAllCollections returned non-array', { where, raw });
+    return [];
+  }
+
+  /**
+   * Canonical blob for `custom[workflowSearch]` plus legacy LS split (config vs saved array).
+   *
+   * `uiTheme` is included so it syncs across devices whenever another setting is saved,
+   * but it never triggers its own `saveConfiguration` call (which would reload the plugin).
+   * On read, `localStorage` wins so the local pick applies instantly even if the server blob is stale.
+   */
   function wsWorkflowSearchPersistShapes(normalized) {
     const n = wsNormalizePersist(normalized);
     const customNs = {
@@ -74,6 +98,7 @@
       peopleCollectionGuid: n.peopleCollectionGuid,
       peopleNameProp: n.peopleNameProp,
       savedSearches: n.savedSearches,
+      uiTheme: n.uiTheme,
     };
     return {
       customNs,
@@ -82,9 +107,72 @@
         tagPropName: customNs.tagPropName,
         peopleCollectionGuid: customNs.peopleCollectionGuid,
         peopleNameProp: customNs.peopleNameProp,
+        uiTheme: customNs.uiTheme,
       },
       lsSaved: customNs.savedSearches,
     };
+  }
+
+  /**
+   * Theme helpers. `localStorage` is the fast path (no reload on change); the server blob mirrors it for cross-device sync,
+   * written opportunistically whenever another setting is saved (see `_savePersisted`).
+   */
+  function wsReadLocalTheme() {
+    try {
+      const v = localStorage.getItem(WS_LS_THEME);
+      if (v === 'dark' || v === 'light' || v === 'system') return v;
+    } catch (e) {}
+    return null;
+  }
+  function wsWriteLocalTheme(v) {
+    const t = v === 'dark' || v === 'light' || v === 'system' ? v : 'system';
+    try { localStorage.setItem(WS_LS_THEME, t); } catch (e) {}
+    return t;
+  }
+
+  /**
+   * Resolve "system" to a concrete 'dark' or 'light' by inspecting the host app, not just the OS.
+   *
+   * Thymer (and most Electron hosts) manage their own theme independent of `prefers-color-scheme`,
+   * so relying purely on the CSS media query makes "Match System" track the OS rather than the app,
+   * which surprises users. Strategy:
+   *   1. Look for common theme hints on `<html>` / `<body>` (classes + dataset).
+   *   2. Fall back to the computed luminance of `<body>`'s background color.
+   *   3. Fall back to `window.matchMedia('(prefers-color-scheme: dark)')`.
+   */
+  function wsResolveSystemTheme() {
+    try {
+      const candidates=[];
+      if (typeof document!=='undefined') {
+        if (document.documentElement) candidates.push(document.documentElement);
+        if (document.body) candidates.push(document.body);
+      }
+      const darkHints=['dark','theme-dark','is-dark','mode-dark','bp-dark'];
+      const lightHints=['light','theme-light','is-light','mode-light','bp-light'];
+      for (const el of candidates) {
+        const cl=el.classList;
+        for (const h of darkHints) if (cl.contains(h)) return 'dark';
+        for (const h of lightHints) if (cl.contains(h)) return 'light';
+        const ds=el.dataset||{};
+        const v=(ds.theme||ds.colorMode||ds.colorTheme||ds.appearance||'').toLowerCase();
+        if (v==='dark') return 'dark';
+        if (v==='light') return 'light';
+      }
+      if (typeof getComputedStyle==='function' && candidates[1]) {
+        const bg=getComputedStyle(candidates[1]).backgroundColor||'';
+        const m=/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(bg);
+        if (m) {
+          const r=+m[1],g=+m[2],b=+m[3];
+          const lum=(0.2126*r+0.7152*g+0.0722*b)/255;
+          if (lum<0.5) return 'dark';
+          return 'light';
+        }
+      }
+    } catch(e) {}
+    try {
+      if (typeof window!=='undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
+    } catch(e) {}
+    return 'light';
   }
 
   /** Line-derived body text indexed per record (beyond this, terms in the tail are not matched locally). */
@@ -114,7 +202,120 @@
     });
   }
 
-  const WS_CSS = `
+  const WS_CSS = `    /* WorkflowSearch panel theme: dark default; light via prefers-color-scheme when data-ws-theme=system, or forced via settings (data-ws-theme=light|dark) */
+    .ws-root, .ws-preview-ctx-menu {
+      color-scheme: dark;
+      --ws-fg: #f4efe6;
+      --ws-muted: #9e9486;
+      --ws-accent-t: #c4b8ff;
+      --ws-caret: #c4b8ff;
+      --ws-accent-rgb: 124, 106, 247;
+      --ws-on-surface: #ffffff;
+      --ws-muted-rgb: 158, 148, 134;
+      --ws-on-dark-rgb: 255, 255, 255;
+      --ws-blue: #a8d8ff;
+      --ws-blue-rgb: 100, 180, 255;
+      --ws-tag-rgb: 196, 168, 130;
+      --ws-sub: #bcb0a0;
+      --ws-step: #d2c8ba;
+      --ws-scope-chip: #d4c8f0;
+      --ws-tag-fg: #c4a882;
+      --ws-pop: #1e1c26;
+      --ws-panel: #1c1a22;
+      --ws-menu: #2a2620;
+      --ws-shadow-ac: rgba(0,0,0,0.45);
+      --ws-shadow-menu: rgba(0,0,0,0.5);
+      --ws-shadow-panel: rgba(0,0,0,0.4);
+      --ws-scrim: rgba(0,0,0,0.5);
+      --ws-warn-fg: #e8c090;
+      --ws-warn-bg: rgba(255, 152, 0, 0.09);
+      --ws-warn-bd: rgba(255, 152, 0, 0.14);
+      --ws-success-rgb: 76, 175, 80;
+      --ws-pending: #ff9800;
+      --ws-accent-solid: #7c6af7;
+      --ws-ok: #4caf50;
+    }
+    @media (prefers-color-scheme: light) {
+      .ws-root[data-ws-theme="system"],
+      .ws-root:not([data-ws-theme]),
+      .ws-preview-ctx-menu[data-ws-theme="system"],
+      .ws-preview-ctx-menu:not([data-ws-theme]) {
+        color-scheme: light;
+        --ws-fg: #3a3545;
+        --ws-muted: #6d6878;
+        --ws-accent-t: #5a48b0;
+        --ws-caret: #5b47b8;
+        --ws-accent-rgb: 93, 74, 214;
+        --ws-on-surface: #ffffff;
+        --ws-muted-rgb: 109, 104, 120;
+        --ws-on-dark-rgb: 32, 30, 42;
+        --ws-blue: #0d62b8;
+        --ws-blue-rgb: 13, 98, 184;
+        --ws-tag-rgb: 140, 95, 48;
+        --ws-sub: #6d6878;
+        --ws-step: #756f82;
+        --ws-scope-chip: #4a3d7a;
+        --ws-tag-fg: #7a5a32;
+        --ws-pop: #ffffff;
+        --ws-panel: #f4f2f9;
+        --ws-menu: #ffffff;
+        --ws-shadow-ac: rgba(0,0,0,0.12);
+        --ws-shadow-menu: rgba(0,0,0,0.14);
+        --ws-shadow-panel: rgba(0,0,0,0.1);
+        --ws-scrim: rgba(0,0,0,0.35);
+        --ws-warn-fg: #7a4a00;
+        --ws-warn-bg: rgba(255, 167, 38, 0.16);
+        --ws-warn-bd: rgba(200, 110, 0, 0.22);
+        --ws-success-rgb: 46, 125, 50;
+        --ws-pending: #e65100;
+        --ws-accent-solid: #5b47c4;
+        --ws-ok: #2e7d32;
+      }
+    }
+    .ws-root[data-ws-theme="light"],
+    .ws-preview-ctx-menu[data-ws-theme="light"] {
+      color-scheme: light;
+      --ws-fg: #3a3545;
+      --ws-muted: #6d6878;
+      --ws-accent-t: #5a48b0;
+      --ws-caret: #5b47b8;
+      --ws-accent-rgb: 93, 74, 214;
+      --ws-on-surface: #ffffff;
+      --ws-muted-rgb: 109, 104, 120;
+      --ws-on-dark-rgb: 32, 30, 42;
+      --ws-blue: #0d62b8;
+      --ws-blue-rgb: 13, 98, 184;
+      --ws-tag-rgb: 140, 95, 48;
+      --ws-sub: #6d6878;
+      --ws-step: #756f82;
+      --ws-scope-chip: #4a3d7a;
+      --ws-tag-fg: #7a5a32;
+      --ws-pop: #ffffff;
+      --ws-panel: #f4f2f9;
+      --ws-menu: #ffffff;
+      --ws-shadow-ac: rgba(0,0,0,0.12);
+      --ws-shadow-menu: rgba(0,0,0,0.14);
+      --ws-shadow-panel: rgba(0,0,0,0.1);
+      --ws-scrim: rgba(0,0,0,0.35);
+      --ws-warn-fg: #7a4a00;
+      --ws-warn-bg: rgba(255, 167, 38, 0.16);
+      --ws-warn-bd: rgba(200, 110, 0, 0.22);
+      --ws-success-rgb: 46, 125, 50;
+      --ws-pending: #e65100;
+      --ws-accent-solid: #5b47c4;
+      --ws-ok: #2e7d32;
+    }
+    .ws-preview-person-badge {
+      flex-shrink: 0;
+      font-size: 9px;
+      color: var(--ws-blue);
+      background: rgba(var(--ws-blue-rgb), 0.1);
+      border: 1px solid rgba(var(--ws-blue-rgb), 0.22);
+      border-radius: 3px;
+      padding: 0 4px;
+      white-space: nowrap;
+    }
+
     .ws-root {
       position: relative;
       display: flex;
@@ -123,7 +324,8 @@
       min-height: 0;
       width: 100%;
       overflow: hidden;
-      color: #e8e0d0;
+      background: var(--ws-panel);
+      color: var(--ws-fg);
       font-family: var(--font-family, sans-serif);
       font-size: 13px;
       text-align: left;
@@ -133,203 +335,203 @@
     .ws-input-wrap .ws-input { width: 100%; padding-right: 28px; }
     .ws-clear-btn {
       position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
-      background: none; border: none; cursor: pointer; color: #8a7e6a;
+      background: none; border: none; cursor: pointer; color: var(--ws-muted);
       display: flex; align-items: center; justify-content: center;
       padding: 2px; border-radius: 3px; line-height: 1; transition: color 0.1s;
     }
-    .ws-clear-btn:hover { color: #e8e0d0; }
+    .ws-clear-btn:hover { color: var(--ws-fg); }
     .ws-clear-btn .ti { font-size: 11px; }
     .ws-clear-btn.ws-hidden { display: none; }
     .ws-header {
       display: flex; flex-direction: column; gap: 6px; padding: 8px 12px 10px;
-      border-bottom: 1px solid rgba(255,255,255,0.07); flex-shrink: 0;
+      border-bottom: 1px solid rgba(var(--ws-on-dark-rgb),0.07); flex-shrink: 0;
     }
     .ws-header-top { display: flex; justify-content: flex-end; align-items: center; min-height: 0; }
     .ws-header-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
     .ws-header-search { display: flex; align-items: center; gap: 8px; min-width: 0; width: 100%; }
     .ws-header-search .ws-input-wrap { flex: 1; min-width: 0; }
-    .ws-header-icon { color: #8a7e6a; flex-shrink: 0; display: flex; align-items: center; }
+    .ws-header-icon { color: var(--ws-muted); flex-shrink: 0; display: flex; align-items: center; }
     .ws-header-icon .ti { font-size: 16px; }
     .ws-input {
-      flex: 1; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10);
-      border-radius: 7px; outline: none; color: #e8e0d0; font-size: 14px; font-family: inherit;
-      caret-color: #c4b8ff; min-width: 0; padding: 5px 10px; transition: border-color 0.12s;
+      flex: 1; background: rgba(var(--ws-on-dark-rgb),0.05); border: 1px solid rgba(var(--ws-on-dark-rgb),0.10);
+      border-radius: 7px; outline: none; color: var(--ws-fg); font-size: 14px; font-family: inherit;
+      caret-color: var(--ws-accent-t); min-width: 0; padding: 5px 10px; transition: border-color 0.12s;
     }
-    .ws-input:focus { border-color: rgba(124,106,247,0.55); background: rgba(255,255,255,0.07); }
-    .ws-input::placeholder { color: rgba(138,126,106,0.55); }
+    .ws-input:focus { border-color: rgba(var(--ws-accent-rgb),0.55); background: rgba(var(--ws-on-dark-rgb),0.07); }
+    .ws-input::placeholder { color: rgba(var(--ws-muted-rgb),0.55); }
     .ws-ac {
       display: none; position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 50;
       max-height: 220px; overflow-y: auto; overflow-x: hidden;
-      background: #1e1c26; border: 1px solid rgba(124,106,247,0.35); border-radius: 8px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.45); padding: 4px 0; text-align: left;
+      background: var(--ws-pop); border: 1px solid rgba(var(--ws-accent-rgb),0.35); border-radius: 8px;
+      box-shadow: 0 8px 24px var(--ws-shadow-ac); padding: 4px 0; text-align: left;
     }
     .ws-ac.ws-ac-visible { display: block; }
     .ws-ac-item {
       display: flex; align-items: flex-start; gap: 8px; padding: 6px 10px; cursor: pointer;
-      font-size: 12px; color: #e8e0d0; border-left: 2px solid transparent;
+      font-size: 12px; color: var(--ws-fg); border-left: 2px solid transparent;
     }
-    .ws-ac-item:hover, .ws-ac-item.ws-ac-sel { background: rgba(124,106,247,0.18); border-left-color: rgba(124,106,247,0.65); }
-    .ws-ac-kind { flex-shrink: 0; font-size: 9px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a7e6a; min-width: 52px; padding-top: 1px; }
+    .ws-ac-item:hover, .ws-ac-item.ws-ac-sel { background: rgba(var(--ws-accent-rgb),0.18); border-left-color: rgba(var(--ws-accent-rgb),0.65); }
+    .ws-ac-kind { flex-shrink: 0; font-size: 9px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ws-muted); min-width: 52px; padding-top: 1px; }
     .ws-ac-main { flex: 1; min-width: 0; }
     .ws-ac-label { font-weight: 500; }
-    .ws-ac-detail { font-size: 10px; color: #8a7e6a; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ws-ac-detail { font-size: 10px; color: var(--ws-muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .ws-icon-btn {
       display: inline-flex; align-items: center; gap: 4px; background: none; border: none;
-      cursor: pointer; color: #8a7e6a; font-size: 11px; font-weight: 500; padding: 4px 7px;
+      cursor: pointer; color: var(--ws-muted); font-size: 11px; font-weight: 500; padding: 4px 7px;
       border-radius: 6px; transition: color 0.12s, background 0.12s; flex-shrink: 0;
       white-space: nowrap; font-family: inherit;
     }
     .ws-icon-btn .ti { font-size: 13px; vertical-align: -0.12em; }
-    .ws-icon-btn:hover { color: #e8e0d0; background: rgba(255,255,255,0.07); }
-    .ws-icon-btn.ws-active { color: #c4b8ff; background: rgba(124,106,247,0.18); }
+    .ws-icon-btn:hover { color: var(--ws-fg); background: rgba(var(--ws-on-dark-rgb),0.07); }
+    .ws-icon-btn.ws-active { color: var(--ws-accent-t); background: rgba(var(--ws-accent-rgb),0.18); }
     .ws-icon-btn:disabled { opacity: 0.38; cursor: default; pointer-events: none; }
     .ws-icon-btn.ws-hidden { display: none; }
     .ws-saved-row {
       display: flex; align-items: center; gap: 5px; padding: 6px 12px;
-      border-bottom: 1px solid rgba(255,255,255,0.06); flex-wrap: wrap; flex-shrink: 0;
+      border-bottom: 1px solid rgba(var(--ws-on-dark-rgb),0.06); flex-wrap: wrap; flex-shrink: 0;
     }
-    .ws-saved-label { font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a7e6a; margin-right: 2px; flex-shrink: 0; }
+    .ws-saved-label { font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ws-muted); margin-right: 2px; flex-shrink: 0; }
     .ws-chip {
-      display: inline-flex; align-items: center; gap: 3px; background: rgba(124,106,247,0.10);
-      border: 1px solid rgba(124,106,247,0.22); border-radius: 20px; padding: 2px 6px 2px 9px;
-      font-size: 11px; color: #c4b8ff; cursor: default; max-width: 140px; overflow: hidden;
+      display: inline-flex; align-items: center; gap: 3px; background: rgba(var(--ws-accent-rgb),0.10);
+      border: 1px solid rgba(var(--ws-accent-rgb),0.22); border-radius: 20px; padding: 2px 6px 2px 9px;
+      font-size: 11px; color: var(--ws-accent-t); cursor: default; max-width: 140px; overflow: hidden;
     }
     .ws-chip-label { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
     .ws-chip-label:hover { text-decoration: underline; }
-    .ws-chip-del { background: none; border: none; cursor: pointer; color: #8a7e6a; padding: 0 2px; line-height: 1; display: flex; align-items: center; flex-shrink: 0; transition: color 0.1s; }
-    .ws-chip-del:hover { color: #e8e0d0; }
+    .ws-chip-del { background: none; border: none; cursor: pointer; color: var(--ws-muted); padding: 0 2px; line-height: 1; display: flex; align-items: center; flex-shrink: 0; transition: color 0.1s; }
+    .ws-chip-del:hover { color: var(--ws-fg); }
     .ws-chip-del .ti { font-size: 9px; }
     .ws-status {
-      padding: 4px 14px; font-size: 10px; color: rgba(138,126,106,0.7); letter-spacing: 0.04em;
-      border-bottom: 1px solid rgba(255,255,255,0.045); flex-shrink: 0; display: flex; align-items: center; gap: 6px;
+      padding: 4px 14px; font-size: 10px; color: rgba(var(--ws-muted-rgb),0.7); letter-spacing: 0.04em;
+      border-bottom: 1px solid rgba(var(--ws-on-dark-rgb),0.045); flex-shrink: 0; display: flex; align-items: center; gap: 6px;
     }
-    .ws-status-dot { width: 5px; height: 5px; border-radius: 50%; background: #4caf50; flex-shrink: 0; }
-    .ws-status-dot.ws-building { background: #ff9800; animation: ws-pulse 1.2s ease-in-out infinite; }
+    .ws-status-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--ws-ok); flex-shrink: 0; }
+    .ws-status-dot.ws-building { background: var(--ws-pending); animation: ws-pulse 1.2s ease-in-out infinite; }
     @keyframes ws-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
     .ws-people-warn {
-      padding: 8px 14px; font-size: 11px; line-height: 1.45; color: #e8c090;
-      background: rgba(255, 152, 0, 0.09); border-bottom: 1px solid rgba(255, 152, 0, 0.14);
+      padding: 8px 14px; font-size: 11px; line-height: 1.45; color: var(--ws-warn-fg);
+      background: var(--ws-warn-bg); border-bottom: 1px solid var(--ws-warn-bd);
       flex-shrink: 0;
     }
     .ws-people-warn.ws-hidden { display: none; }
     .ws-body { flex: 1; overflow-y: auto; min-height: 0; padding: 2px 0 8px; }
-    .ws-empty { padding: 32px 16px; text-align: center; color: #8a7e6a; font-size: 12px; line-height: 1.7; }
+    .ws-empty { padding: 32px 16px; text-align: center; color: var(--ws-muted); font-size: 12px; line-height: 1.7; }
     .ws-empty-icon { margin-bottom: 10px; opacity: 0.65; }
     .ws-empty-icon .ti { font-size: 26px; }
-    .ws-empty-hint { font-size: 10px; color: rgba(138,126,106,0.5); margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.9; }
+    .ws-empty-hint { font-size: 10px; color: rgba(var(--ws-muted-rgb),0.5); margin-top: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.9; }
     .ws-result-wrap { border-left: 2px solid transparent; }
-    .ws-result-wrap.ws-selected { background: rgba(124,106,247,0.13); border-left-color: rgba(124,106,247,0.65); }
-    .ws-result-wrap.ws-opened { border-left-color: rgba(76,175,80,0.7); }
+    .ws-result-wrap.ws-selected { background: rgba(var(--ws-accent-rgb),0.13); border-left-color: rgba(var(--ws-accent-rgb),0.65); }
+    .ws-result-wrap.ws-opened { border-left-color: rgba(var(--ws-success-rgb),0.7); }
     .ws-result-row { display: flex; align-items: flex-start; gap: 0; min-width: 0; }
     .ws-result-expand {
       flex-shrink: 0; align-self: flex-start; margin-top: 2px; background: none; border: none;
-      cursor: pointer; color: #8a7e6a; padding: 2px 4px 2px 8px; border-radius: 4px;
+      cursor: pointer; color: var(--ws-muted); padding: 2px 4px 2px 8px; border-radius: 4px;
       line-height: 1; transition: color 0.1s, transform 0.12s;
     }
-    .ws-result-expand:hover { color: #e8e0d0; background: rgba(255,255,255,0.04); }
-    .ws-result-expand.ws-expanded { transform: rotate(90deg); color: #c4b8ff; }
+    .ws-result-expand:hover { color: var(--ws-fg); background: rgba(var(--ws-on-dark-rgb),0.04); }
+    .ws-result-expand.ws-expanded { transform: rotate(90deg); color: var(--ws-accent-t); }
     .ws-result-expand.ws-hidden { display: none; }
     .ws-result-expand .ti { font-size: 14px; }
-    .ws-preview { padding: 0 12px 8px 32px; font-size: 11px; color: #a89a82; line-height: 1.45; }
-    .ws-preview-loading, .ws-preview-empty { padding: 4px 0 2px; color: #8a7e6a; font-style: italic; }
+    .ws-preview { padding: 0 12px 8px 32px; font-size: 11px; color: var(--ws-sub); line-height: 1.45; }
+    .ws-preview-loading, .ws-preview-empty { padding: 4px 0 2px; color: var(--ws-muted); font-style: italic; }
     .ws-preview-line {
       padding: 4px 8px; margin: 2px 0; border-radius: 5px; cursor: pointer;
-      border: 1px solid rgba(255,255,255,0.06); background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(var(--ws-on-dark-rgb),0.06); background: rgba(var(--ws-on-dark-rgb),0.03);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .ws-preview-line:hover { background: rgba(124,106,247,0.12); border-color: rgba(124,106,247,0.25); color: #e8e0d0; }
+    .ws-preview-line:hover { background: rgba(var(--ws-accent-rgb),0.12); border-color: rgba(var(--ws-accent-rgb),0.25); color: var(--ws-fg); }
     .ws-preview-prop {
       padding: 4px 8px; margin: 2px 0; border-radius: 5px;
-      border: 1px solid rgba(100,180,255,0.12); background: rgba(100,180,255,0.05);
-      display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a89a82;
+      border: 1px solid rgba(var(--ws-blue-rgb),0.12); background: rgba(var(--ws-blue-rgb),0.05);
+      display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ws-sub);
       cursor: pointer;
     }
-    .ws-preview-prop:hover { background: rgba(100,180,255,0.12); border-color: rgba(100,180,255,0.3); color: #e8e0d0; }
-    .ws-preview-prop-name { color: #8a7e6a; flex-shrink: 0; }
-    .ws-preview-prop-arrow { color: #8a7e6a; flex-shrink: 0; }
-    .ws-preview-prop-value { color: #a8d8ff; }
+    .ws-preview-prop:hover { background: rgba(var(--ws-blue-rgb),0.12); border-color: rgba(var(--ws-blue-rgb),0.3); color: var(--ws-fg); }
+    .ws-preview-prop-name { color: var(--ws-muted); flex-shrink: 0; }
+    .ws-preview-prop-arrow { color: var(--ws-muted); flex-shrink: 0; }
+    .ws-preview-prop-value { color: var(--ws-blue); }
     .ws-preview-ctx-menu { position: fixed; z-index: 100000; min-width: 200px; padding: 4px 0; border-radius: 8px;
-      background: #2a2620; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 8px 28px rgba(0,0,0,0.5);
-      font-size: 11px; color: #e8e0d0; }
+      background: var(--ws-menu); border: 1px solid rgba(var(--ws-on-dark-rgb),0.12); box-shadow: 0 8px 28px var(--ws-shadow-menu);
+      font-size: 11px; color: var(--ws-fg); }
     .ws-preview-ctx-item {
       display: block; width: 100%; text-align: left; padding: 7px 12px; border: none; background: transparent;
       color: inherit; font: inherit; cursor: pointer; white-space: nowrap;
     }
-    .ws-preview-ctx-item:hover { background: rgba(124,106,247,0.2); color: #fff; }
+    .ws-preview-ctx-item:hover { background: rgba(var(--ws-accent-rgb),0.2); color: var(--ws-on-surface); }
     .ws-result { flex: 1; min-width: 0; padding: 6px 12px 6px 4px; cursor: pointer; transition: background 0.08s; }
-    .ws-result:hover { background: rgba(255,255,255,0.04); }
+    .ws-result:hover { background: rgba(var(--ws-on-dark-rgb),0.04); }
     .ws-result-main { display: flex; align-items: center; gap: 7px; min-width: 0; }
-    .ws-result-icon { color: #8a7e6a; flex-shrink: 0; display: flex; align-items: center; }
+    .ws-result-icon { color: var(--ws-muted); flex-shrink: 0; display: flex; align-items: center; }
     .ws-result-icon .ti { font-size: 12px; }
     .ws-result-icon-dim { opacity: 0.35; }
-    .ws-result-name { flex: 1; font-size: 12px; color: #e8e0d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .ws-result-col { font-size: 9px; color: #8a7e6a; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 3px; padding: 1px 5px; white-space: nowrap; flex-shrink: 0; }
-    .ws-result-wrap.ws-selected .ws-result-col { background: rgba(124,106,247,0.12); border-color: rgba(124,106,247,0.25); color: #c4b8ff; }
+    .ws-result-name { flex: 1; font-size: 12px; color: var(--ws-fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ws-result-col { font-size: 9px; color: var(--ws-muted); background: rgba(var(--ws-on-dark-rgb),0.05); border: 1px solid rgba(var(--ws-on-dark-rgb),0.08); border-radius: 3px; padding: 1px 5px; white-space: nowrap; flex-shrink: 0; }
+    .ws-result-wrap.ws-selected .ws-result-col { background: rgba(var(--ws-accent-rgb),0.12); border-color: rgba(var(--ws-accent-rgb),0.25); color: var(--ws-accent-t); }
     .ws-result-tags { display: flex; gap: 4px; margin-top: 2px; margin-left: 19px; flex-wrap: wrap; }
-    .ws-tag { font-size: 9px; color: #c4a882; background: rgba(196,168,130,0.09); border-radius: 3px; padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    .ws-result-wrap.ws-selected .ws-tag { color: #c4b8ff; background: rgba(124,106,247,0.10); }
-    .ws-body-sep { display: flex; align-items: center; gap: 8px; padding: 8px 12px 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #8a7e6a; }
-    .ws-body-sep::before, .ws-body-sep::after { content: ''; flex: 1; height: 1px; background: rgba(255,255,255,0.07); }
-    .ws-body-badge { font-size: 9px; color: #c4a882; background: rgba(196,168,130,0.10); border: 1px solid rgba(196,168,130,0.20); border-radius: 3px; padding: 0 4px; margin-left: 4px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
-    .ws-person-badge { font-size: 9px; color: #a8d8ff; background: rgba(100,180,255,0.10); border: 1px solid rgba(100,180,255,0.25); border-radius: 3px; padding: 0 4px; margin-left: 4px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
+    .ws-tag { font-size: 9px; color: var(--ws-tag-fg); background: rgba(var(--ws-tag-rgb),0.09); border-radius: 3px; padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .ws-result-wrap.ws-selected .ws-tag { color: var(--ws-accent-t); background: rgba(var(--ws-accent-rgb),0.10); }
+    .ws-body-sep { display: flex; align-items: center; gap: 8px; padding: 8px 12px 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ws-muted); }
+    .ws-body-sep::before, .ws-body-sep::after { content: ''; flex: 1; height: 1px; background: rgba(var(--ws-on-dark-rgb),0.07); }
+    .ws-body-badge { font-size: 9px; color: var(--ws-tag-fg); background: rgba(var(--ws-tag-rgb),0.10); border: 1px solid rgba(var(--ws-tag-rgb),0.20); border-radius: 3px; padding: 0 4px; margin-left: 4px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
+    .ws-person-badge { font-size: 9px; color: var(--ws-blue); background: rgba(var(--ws-blue-rgb),0.10); border: 1px solid rgba(var(--ws-blue-rgb),0.25); border-radius: 3px; padding: 0 4px; margin-left: 4px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; flex-shrink: 0; }
     .ws-config-section { padding: 2px 0; }
-    .ws-config-title { font-size: 10px; font-weight: 600; color: #8a7e6a; text-transform: uppercase; letter-spacing: 0.07em; padding: 10px 14px 5px; }
+    .ws-config-title { font-size: 10px; font-weight: 600; color: var(--ws-muted); text-transform: uppercase; letter-spacing: 0.07em; padding: 10px 14px 5px; }
     .ws-config-col-list { padding: 0 6px; }
-    .ws-config-col-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; cursor: pointer; border-radius: 6px; font-size: 12px; color: #e8e0d0; transition: background 0.1s; user-select: none; }
-    .ws-config-col-row:hover { background: rgba(255,255,255,0.05); }
-    .ws-config-cb { accent-color: #7c6af7; cursor: pointer; flex-shrink: 0; width: 13px; height: 13px; }
-    .ws-config-divider { height: 1px; background: rgba(255,255,255,0.07); margin: 6px 14px; }
+    .ws-config-col-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; cursor: pointer; border-radius: 6px; font-size: 12px; color: var(--ws-fg); transition: background 0.1s; user-select: none; }
+    .ws-config-col-row:hover { background: rgba(var(--ws-on-dark-rgb),0.05); }
+    .ws-config-cb { accent-color: var(--ws-accent-solid); cursor: pointer; flex-shrink: 0; width: 13px; height: 13px; }
+    .ws-config-divider { height: 1px; background: rgba(var(--ws-on-dark-rgb),0.07); margin: 6px 14px; }
     .ws-scope-row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:0 14px 6px; font-size:11px; min-height:0; }
     .ws-scope-row.ws-hidden { display:none; }
-    .ws-scope-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:4px; background:rgba(124,106,247,0.12); border:1px solid rgba(124,106,247,0.28); color:#d4c8f0; max-width:100%; }
+    .ws-scope-chip { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:4px; background:rgba(var(--ws-accent-rgb),0.12); border:1px solid rgba(var(--ws-accent-rgb),0.28); color:var(--ws-scope-chip); max-width:100%; }
     .ws-scope-chip-implicit { border-style:dashed; opacity:0.92; }
     .ws-scope-chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .ws-scope-chip .ws-scope-x { background:none; border:none; cursor:pointer; color:#8a7e6a; padding:0 2px; flex-shrink:0; }
+    .ws-scope-chip .ws-scope-x { background:none; border:none; cursor:pointer; color:var(--ws-muted); padding:0 2px; flex-shrink:0; }
     /* fixed = viewport-sized; absolute inside .ws-root was clipped by panel overflow:hidden */
-    .ws-scope-overlay { position:fixed; inset:0; z-index:100000; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:flex-start; padding:32px 24px 32px 28px; box-sizing:border-box; overflow:auto; }
-    .ws-scope-panel { width:min(520px,calc(100vw - 32px)); height:min(520px,calc(100vh - 64px)); max-height:min(520px,calc(100vh - 64px)); min-height:0; transform:translateX(50%); background:#1c1a22; border:1px solid rgba(255,255,255,0.12); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,0.4); }
-    .ws-scope-head { flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid rgba(255,255,255,0.08); font-weight:600; font-size:13px; color:#e8e0d0; }
-    .ws-scope-head button { background:none; border:none; cursor:pointer; color:#8a7e6a; padding:4px; }
-    .ws-scope-tabs { flex-shrink:0; display:flex; gap:4px; padding:8px 10px; border-bottom:1px solid rgba(255,255,255,0.06); }
-    .ws-scope-tab { flex:1; padding:6px 8px; border-radius:5px; border:none; cursor:pointer; font-size:11px; background:rgba(255,255,255,0.05); color:#a89a82; }
-    .ws-scope-tab.ws-scope-tab-sel { background:rgba(124,106,247,0.22); color:#e8e0d0; }
+    .ws-scope-overlay { position:fixed; inset:0; z-index:100000; background:var(--ws-scrim); display:flex; align-items:center; justify-content:flex-start; padding:32px 24px 32px 28px; box-sizing:border-box; overflow:auto; }
+    .ws-scope-panel { width:min(520px,calc(100vw - 32px)); height:min(520px,calc(100vh - 64px)); max-height:min(520px,calc(100vh - 64px)); min-height:0; transform:translateX(50%); background:var(--ws-panel); border:1px solid rgba(var(--ws-on-dark-rgb),0.12); border-radius:8px; overflow:hidden; display:flex; flex-direction:column; box-shadow:0 8px 32px var(--ws-shadow-panel); }
+    .ws-scope-head { flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid rgba(var(--ws-on-dark-rgb),0.08); font-weight:600; font-size:13px; color:var(--ws-fg); }
+    .ws-scope-head button { background:none; border:none; cursor:pointer; color:var(--ws-muted); padding:4px; }
+    .ws-scope-tabs { flex-shrink:0; display:flex; gap:4px; padding:8px 10px; border-bottom:1px solid rgba(var(--ws-on-dark-rgb),0.06); }
+    .ws-scope-tab { flex:1; padding:6px 8px; border-radius:5px; border:none; cursor:pointer; font-size:11px; background:rgba(var(--ws-on-dark-rgb),0.05); color:var(--ws-sub); }
+    .ws-scope-tab.ws-scope-tab-sel { background:rgba(var(--ws-accent-rgb),0.22); color:var(--ws-fg); }
     .ws-scope-panel > .ws-scope-step-hint { flex-shrink:0; }
-    .ws-scope-stepbar { flex-shrink:0; padding:8px 12px; font-size:11px; font-weight:600; color:#c4b8a8; letter-spacing:0.02em; border-bottom:1px solid rgba(255,255,255,0.06); }
+    .ws-scope-stepbar { flex-shrink:0; padding:8px 12px; font-size:11px; font-weight:600; color:var(--ws-step); letter-spacing:0.02em; border-bottom:1px solid rgba(var(--ws-on-dark-rgb),0.06); }
     .ws-scope-confirm { padding:4px 4px 12px; display:flex; flex-direction:column; gap:12px; }
-    .ws-scope-confirm-title { font-size:14px; color:#e8e0d0; line-height:1.35; }
-    .ws-scope-confirm-meta { font-size:11px; color:#8a7e6a; margin-top:4px; }
+    .ws-scope-confirm-title { font-size:14px; color:var(--ws-fg); line-height:1.35; }
+    .ws-scope-confirm-meta { font-size:11px; color:var(--ws-muted); margin-top:4px; }
     .ws-scope-confirm-actions { display:flex; flex-direction:column; gap:8px; }
     .ws-scope-confirm-actions .ws-btn { width:100%; text-align:center; justify-content:center; }
-    .ws-scope-filter { flex-shrink:0; margin:0 10px 8px; padding:6px 10px; border-radius:5px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.06); color:#e8e0d0; font-size:12px; outline:none; font-family:inherit; }
+    .ws-scope-filter { flex-shrink:0; margin:0 10px 8px; padding:6px 10px; border-radius:5px; border:1px solid rgba(var(--ws-on-dark-rgb),0.12); background:rgba(var(--ws-on-dark-rgb),0.06); color:var(--ws-fg); font-size:12px; outline:none; font-family:inherit; }
     .ws-scope-list { flex:1 1 0; min-height:0; overflow-y:auto; overflow-x:hidden; -webkit-overflow-scrolling:touch; padding:0 6px 10px; }
-    .ws-scope-item { width:100%; text-align:left; padding:8px 10px; margin:2px 0; border-radius:5px; border:none; cursor:pointer; background:transparent; color:#e8e0d0; font-size:12px; font-family:inherit; display:block; }
-    .ws-scope-item:hover { background:rgba(124,106,247,0.15); }
-    .ws-scope-item small { display:block; color:#8a7e6a; font-size:10px; margin-top:2px; }
-    .ws-scope-back { margin:0 10px 8px; padding:4px 0; background:none; border:none; color:#a89a82; cursor:pointer; font-size:11px; }
-    .ws-scope-hint { padding:8px 12px; font-size:11px; color:#8a7e6a; line-height:1.4; }
+    .ws-scope-item { width:100%; text-align:left; padding:8px 10px; margin:2px 0; border-radius:5px; border:none; cursor:pointer; background:transparent; color:var(--ws-fg); font-size:12px; font-family:inherit; display:block; }
+    .ws-scope-item:hover { background:rgba(var(--ws-accent-rgb),0.15); }
+    .ws-scope-item small { display:block; color:var(--ws-muted); font-size:10px; margin-top:2px; }
+    .ws-scope-back { margin:0 10px 8px; padding:4px 0; background:none; border:none; color:var(--ws-sub); cursor:pointer; font-size:11px; }
+    .ws-scope-hint { padding:8px 12px; font-size:11px; color:var(--ws-muted); line-height:1.4; }
     .ws-config-field { display: flex; align-items: center; gap: 8px; padding: 0 14px 10px; }
-    .ws-config-field-label { font-size: 11px; color: #8a7e6a; white-space: nowrap; flex-shrink: 0; }
-    .ws-config-input { flex: 1; min-width: 0; padding: 4px 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 5px; color: #e8e0d0; font-size: 12px; outline: none; font-family: inherit; transition: border-color 0.15s; }
-    .ws-config-input:focus { border-color: rgba(124,106,247,0.6); }
-    .ws-config-select { flex: 1; min-width: 0; padding: 4px 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); border-radius: 5px; color: #e8e0d0; font-size: 12px; outline: none; font-family: inherit; cursor: pointer; }
-    .ws-config-select option { background: #1c1a22; }
+    .ws-config-field-label { font-size: 11px; color: var(--ws-muted); white-space: nowrap; flex-shrink: 0; }
+    .ws-config-input { flex: 1; min-width: 0; padding: 4px 8px; background: rgba(var(--ws-on-dark-rgb),0.06); border: 1px solid rgba(var(--ws-on-dark-rgb),0.12); border-radius: 5px; color: var(--ws-fg); font-size: 12px; outline: none; font-family: inherit; transition: border-color 0.15s; }
+    .ws-config-input:focus { border-color: rgba(var(--ws-accent-rgb),0.6); }
+    .ws-config-select { flex: 1; min-width: 0; padding: 4px 8px; background: rgba(var(--ws-on-dark-rgb),0.06); border: 1px solid rgba(var(--ws-on-dark-rgb),0.12); border-radius: 5px; color: var(--ws-fg); font-size: 12px; outline: none; font-family: inherit; cursor: pointer; }
+    .ws-config-select option { background: var(--ws-panel); }
     .ws-config-actions { display: flex; justify-content: flex-end; padding: 6px 14px 12px; gap: 6px; }
     .ws-btn { padding: 5px 14px; border-radius: 6px; border: none; cursor: pointer; font-size: 12px; font-weight: 500; font-family: inherit; transition: all 0.12s; }
-    .ws-btn-primary { background: rgba(124,106,247,0.85); color: #fff; }
-    .ws-btn-primary:hover { background: rgba(124,106,247,1); }
-    .ws-btn-secondary { background: rgba(255,255,255,0.07); color: #e8e0d0; border: 1px solid rgba(255,255,255,0.10); }
-    .ws-btn-secondary:hover { background: rgba(255,255,255,0.12); }
-    .ws-footer { padding: 6px 12px; border-top: 1px solid rgba(255,255,255,0.07); flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; }
-    .ws-result-count { font-size: 10px; color: #8a7e6a; }
-    .ws-hint { font-size: 9px; color: rgba(138,126,106,0.55); letter-spacing: 0.03em; }
-    .ws-save-form { display: flex; align-items: center; gap: 6px; padding: 7px 12px; border-bottom: 1px solid rgba(255,255,255,0.07); background: rgba(124,106,247,0.06); flex-shrink: 0; }
-    .ws-save-form-label { font-size: 10px; color: #8a7e6a; white-space: nowrap; flex-shrink: 0; }
-    .ws-save-input { flex: 1; min-width: 0; padding: 3px 7px; background: rgba(255,255,255,0.07); border: 1px solid rgba(124,106,247,0.4); border-radius: 4px; color: #e8e0d0; font-size: 11px; outline: none; font-family: inherit; }
-    .ws-save-input:focus { border-color: rgba(124,106,247,0.8); }
+    .ws-btn-primary { background: rgba(var(--ws-accent-rgb),0.85); color: var(--ws-on-surface); }
+    .ws-btn-primary:hover { background: rgba(var(--ws-accent-rgb),1); }
+    .ws-btn-secondary { background: rgba(var(--ws-on-dark-rgb),0.07); color: var(--ws-fg); border: 1px solid rgba(var(--ws-on-dark-rgb),0.10); }
+    .ws-btn-secondary:hover { background: rgba(var(--ws-on-dark-rgb),0.12); }
+    .ws-footer { padding: 6px 12px; border-top: 1px solid rgba(var(--ws-on-dark-rgb),0.07); flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; }
+    .ws-result-count { font-size: 10px; color: var(--ws-muted); }
+    .ws-hint { font-size: 9px; color: rgba(var(--ws-muted-rgb),0.55); letter-spacing: 0.03em; }
+    .ws-save-form { display: flex; align-items: center; gap: 6px; padding: 7px 12px; border-bottom: 1px solid rgba(var(--ws-on-dark-rgb),0.07); background: rgba(var(--ws-accent-rgb),0.06); flex-shrink: 0; }
+    .ws-save-form-label { font-size: 10px; color: var(--ws-muted); white-space: nowrap; flex-shrink: 0; }
+    .ws-save-input { flex: 1; min-width: 0; padding: 3px 7px; background: rgba(var(--ws-on-dark-rgb),0.07); border: 1px solid rgba(var(--ws-accent-rgb),0.4); border-radius: 4px; color: var(--ws-fg); font-size: 11px; outline: none; font-family: inherit; }
+    .ws-save-input:focus { border-color: rgba(var(--ws-accent-rgb),0.8); }
     .ws-body::-webkit-scrollbar { width: 4px; }
     .ws-body::-webkit-scrollbar-track { background: transparent; }
-    .ws-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
-    .ws-body::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+    .ws-body::-webkit-scrollbar-thumb { background: rgba(var(--ws-on-dark-rgb),0.12); border-radius: 2px; }
+    .ws-body::-webkit-scrollbar-thumb:hover { background: rgba(var(--ws-on-dark-rgb),0.2); }
   `;
 
   // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1069,7 +1271,7 @@
       const displayName=peopleIndex.isConfigured()?peopleIndex.getDisplayName(guid):'';
       if (!displayName) continue;
       const badge=document.createElement('span');
-      badge.style.cssText='flex-shrink:0;font-size:9px;color:#a8d8ff;background:rgba(100,180,255,0.10);border:1px solid rgba(100,180,255,0.22);border-radius:3px;padding:0 4px;white-space:nowrap;';
+      badge.className='ws-preview-person-badge';
       badge.textContent='@'+displayName;
       div.appendChild(badge);
     }
@@ -1919,7 +2121,14 @@
       const body=host._root?.querySelector('.ws-body'); if (!body) return;
       body.innerHTML=`<div class="ws-empty">${wsIcon('loader')} Loading…</div>`;
       const config=host._h()._getEffectiveConfig();
-      let allCols=[]; try { allCols=await host._h().data.getAllCollections(); } catch(e) {}
+      let allCols=[];
+      let loadError=null;
+      try {
+        allCols=wsCoerceCollectionArray(await host._h().data.getAllCollections(), 'settings');
+      } catch (e) {
+        console.warn('[WorkflowSearch] settings: getAllCollections failed', e);
+        loadError=e;
+      }
       if (!host._configMode||!host._root?.isConnected) return;
       body.innerHTML='';
 
@@ -1927,12 +2136,22 @@
       const colTitle=document.createElement('div'); colTitle.className='ws-config-title'; colTitle.textContent='Collections to search'; colSection.appendChild(colTitle);
       const colList=document.createElement('div'); colList.className='ws-config-col-list';
       for (const col of allCols) {
-        const guid=col.getGuid(),name=col.getName();
+        let guid='',name='';
+        try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
+        if (!guid) continue;
         const included=!config.includedCollectionIds.length||config.includedCollectionIds.includes(guid);
         const row=document.createElement('label'); row.className='ws-config-col-row';
         const cb=document.createElement('input'); cb.type='checkbox'; cb.className='ws-config-cb'; cb.checked=included; cb.dataset.guid=guid;
-        const nameEl=document.createElement('span'); nameEl.textContent=name;
+        const nameEl=document.createElement('span'); nameEl.textContent=name||guid;
         row.appendChild(cb); row.appendChild(nameEl); colList.appendChild(row);
+      }
+      if (!allCols.length) {
+        const msg=document.createElement('div');
+        msg.style.cssText='padding:8px 14px;font-size:11px;color:var(--ws-muted);line-height:1.5';
+        msg.textContent=loadError
+          ? 'Could not load collections (see console). Try reopening settings.'
+          : 'No collections were returned by Thymer. Try reopening settings or reloading.';
+        colSection.appendChild(msg);
       }
       colSection.appendChild(colList); body.appendChild(colSection);
       body.appendChild(Object.assign(document.createElement('div'),{className:'ws-config-divider'}));
@@ -1952,9 +2171,19 @@
       const peopleColLabel=document.createElement('span'); peopleColLabel.className='ws-config-field-label'; peopleColLabel.textContent='Collection:';
       const peopleSel=document.createElement('select'); peopleSel.className='ws-config-select';
       const noneOpt=document.createElement('option'); noneOpt.value=''; noneOpt.textContent='— disabled —'; peopleSel.appendChild(noneOpt);
+      let peopleCurrentFound=false;
       for (const col of allCols) {
-        const o=document.createElement('option'); o.value=col.getGuid(); o.textContent=col.getName();
-        if (col.getGuid()===config.peopleCollectionGuid) o.selected=true;
+        let guid='',name='';
+        try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
+        if (!guid) continue;
+        const o=document.createElement('option'); o.value=guid; o.textContent=name||guid;
+        if (guid===config.peopleCollectionGuid) { o.selected=true; peopleCurrentFound=true; }
+        peopleSel.appendChild(o);
+      }
+      if (config.peopleCollectionGuid&&!peopleCurrentFound) {
+        const o=document.createElement('option'); o.value=config.peopleCollectionGuid;
+        o.textContent=`(unknown collection: ${config.peopleCollectionGuid.slice(0,8)}…)`;
+        o.selected=true;
         peopleSel.appendChild(o);
       }
       peopleColField.appendChild(peopleColLabel); peopleColField.appendChild(peopleSel); peopleSection.appendChild(peopleColField);
@@ -1964,22 +2193,68 @@
       const peopleNameInput=document.createElement('input'); peopleNameInput.className='ws-config-input'; peopleNameInput.value=config.peopleNameProp||''; peopleNameInput.placeholder='(record title)';
       peopleNameField.appendChild(peopleNameLabel); peopleNameField.appendChild(peopleNameInput); peopleSection.appendChild(peopleNameField);
       body.appendChild(peopleSection);
+      body.appendChild(Object.assign(document.createElement('div'),{className:'ws-config-divider'}));
+
+      const themeSection=document.createElement('div'); themeSection.className='ws-config-section';
+      const themeTitle=document.createElement('div'); themeTitle.className='ws-config-title'; themeTitle.textContent='Panel appearance'; themeSection.appendChild(themeTitle);
+      const themeField=document.createElement('div'); themeField.className='ws-config-field';
+      const themeLabel=document.createElement('span'); themeLabel.className='ws-config-field-label'; themeLabel.textContent='Theme:';
+      const themeSel=document.createElement('select'); themeSel.className='ws-config-select';
+      const themeOpts=[
+        { v:'system', t:'Match system (light / dark)' },
+        { v:'dark', t:'Always dark' },
+        { v:'light', t:'Always light' },
+      ];
+      const curTheme=config.uiTheme==='dark'||config.uiTheme==='light'?config.uiTheme:'system';
+      for (const o of themeOpts) {
+        const opt=document.createElement('option'); opt.value=o.v; opt.textContent=o.t;
+        if (o.v===curTheme) opt.selected=true;
+        themeSel.appendChild(opt);
+      }
+      themeField.appendChild(themeLabel); themeField.appendChild(themeSel); themeSection.appendChild(themeField);
+      body.appendChild(themeSection);
 
       const actions=document.createElement('div'); actions.className='ws-config-actions';
       const cancelBtn=document.createElement('button'); cancelBtn.className='ws-btn ws-btn-secondary'; cancelBtn.textContent='Close'; cancelBtn.addEventListener('click',()=>SearchPanelConfig.close(host));
       const saveBtn=document.createElement('button'); saveBtn.className='ws-btn ws-btn-primary'; saveBtn.textContent='Save & Rebuild';
       saveBtn.addEventListener('click',async()=>{
-        const checked=[...colList.querySelectorAll('.ws-config-cb:checked')].map(cb=>cb.dataset.guid);
-        const allChecked=checked.length===allCols.length;
-        await host._h()._saveConfig({
-          includedCollectionIds:allChecked?[]:checked,
-          tagPropName:tagInput.value.trim()||'Tags',
-          peopleCollectionGuid:peopleSel.value||'',
-          peopleNameProp:peopleNameInput.value.trim()||''
-        });
-        SearchPanelConfig.close(host);
+        const checked=[...colList.querySelectorAll('.ws-config-cb:checked')].map(cb=>cb.dataset.guid).filter(Boolean);
+        const allChecked=allCols.length>0&&checked.length===allCols.length;
+        // Theme write-through: update LS + apply immediately so the color flips with no reload.
+        // `_savePersisted` will mirror LS → server blob automatically whenever another setting triggers a real save.
+        const nextTheme=themeSel.value==='dark'||themeSel.value==='light'||themeSel.value==='system'?themeSel.value:'system';
+        wsWriteLocalTheme(nextTheme);
+        host._applyUiTheme();
+
+        // Build a server-persist patch only from keys that actually need a rebuild.
+        const partial={};
+        const nextTag=tagInput.value.trim()||'Tags';
+        if (nextTag!==config.tagPropName) partial.tagPropName=nextTag;
+        const nextPeopleName=peopleNameInput.value.trim()||'';
+        if (nextPeopleName!==(config.peopleNameProp||'')) partial.peopleNameProp=nextPeopleName;
+        if (allCols.length>0) {
+          const nextInc=allChecked?[]:checked;
+          const prevInc=config.includedCollectionIds||[];
+          const sameInc=nextInc.length===prevInc.length&&nextInc.every(g=>prevInc.includes(g));
+          if (!sameInc) partial.includedCollectionIds=nextInc;
+          const nextPeopleGuid=peopleSel.value||'';
+          if (nextPeopleGuid!==(config.peopleCollectionGuid||'')) partial.peopleCollectionGuid=nextPeopleGuid;
+        }
+
+        if (Object.keys(partial).length===0) {
+          // Theme-only (or no-op) save: apply instantly and close. We deliberately do NOT push the theme
+          // to the server here — `saveConfiguration` always reloads the plugin, which would flash the index
+          // rebuild UI. The next time any other setting is saved, `_savePersisted` mirrors the current local
+          // theme into the server blob for free (cross-device sync happens then).
+          SearchPanelConfig.close(host);
+          return;
+        }
+
+        await host._h()._saveConfig(partial);
+        // `saveConfiguration` reloads the plugin; the panel may have been remounted under a new SearchPanel.
+        if (host._root?.isConnected) SearchPanelConfig.close(host);
         await host._h()._buildIndex();
-        if (host._query) host._search(host._query);
+        if (host._root?.isConnected && host._query) host._search(host._query);
       });
       actions.appendChild(cancelBtn); actions.appendChild(saveBtn); body.appendChild(actions);
     },
@@ -2215,7 +2490,7 @@
         for (const guid of matchedGuids) {
           const displayName=people.getDisplayName(guid)||guid.slice(0,8);
           const badge=document.createElement('span');
-          badge.style.cssText='flex-shrink:0;font-size:9px;color:#a8d8ff;background:rgba(100,180,255,0.10);border:1px solid rgba(100,180,255,0.22);border-radius:3px;padding:0 4px;white-space:nowrap;';
+          badge.className='ws-preview-person-badge';
           badge.textContent='@'+displayName;
           div.appendChild(badge);
         }
@@ -2587,9 +2862,57 @@
       this._scopePicker=null;
       this._scopeRowEl=null;
       this._scopeFilterDebounceTimer=null;
+      this._themeWatchers=null;
     }
 
     _h() { return _wsActiveHost || this._plugin; }
+
+    _applyUiTheme() {
+      const t=this._h()._getEffectiveConfig().uiTheme;
+      const choice=t==='dark'||t==='light'||t==='system'?t:'system';
+      // `data-ws-theme` is the CSS hook. For "system" we resolve to a concrete value here so the panel can
+      // follow the host app's theme (Thymer may not mirror the OS `prefers-color-scheme` media query).
+      const applied=choice==='system'?wsResolveSystemTheme():choice;
+      this._root?.setAttribute('data-ws-theme',applied);
+      this._root?.setAttribute('data-ws-theme-choice',choice);
+      if (choice==='system') this._installThemeWatchers(); else this._disposeThemeWatchers();
+    }
+
+    /** Re-apply theme whenever the host/OS changes color scheme. Only active when the user chose "Match System". */
+    _installThemeWatchers() {
+      if (this._themeWatchers) return;
+      const w={ cleanups:[] };
+      try {
+        if (typeof window!=='undefined' && window.matchMedia) {
+          const mql=window.matchMedia('(prefers-color-scheme: dark)');
+          const onMql=()=>this._reapplyIfSystem();
+          if (mql.addEventListener) { mql.addEventListener('change',onMql); w.cleanups.push(()=>mql.removeEventListener('change',onMql)); }
+          else if (mql.addListener) { mql.addListener(onMql); w.cleanups.push(()=>mql.removeListener(onMql)); }
+        }
+      } catch(e) {}
+      try {
+        if (typeof MutationObserver!=='undefined' && typeof document!=='undefined') {
+          const mo=new MutationObserver(()=>this._reapplyIfSystem());
+          const targets=[document.documentElement,document.body].filter(Boolean);
+          for (const t of targets) mo.observe(t,{ attributes:true,attributeFilter:['class','data-theme','data-color-mode','data-color-theme','data-appearance','style'] });
+          w.cleanups.push(()=>{ try { mo.disconnect(); } catch(e) {} });
+        }
+      } catch(e) {}
+      this._themeWatchers=w;
+    }
+
+    _disposeThemeWatchers() {
+      const w=this._themeWatchers; if (!w) return;
+      for (const fn of w.cleanups) { try { fn(); } catch(e) {} }
+      this._themeWatchers=null;
+    }
+
+    _reapplyIfSystem() {
+      if (!this._root?.isConnected) { this._disposeThemeWatchers(); return; }
+      if (this._root.getAttribute('data-ws-theme-choice')!=='system') return;
+      const resolved=wsResolveSystemTheme();
+      if (this._root.getAttribute('data-ws-theme')!==resolved) this._root.setAttribute('data-ws-theme',resolved);
+    }
 
     mount() {
       const el=this._panel.getElement();
@@ -2609,6 +2932,7 @@
       const _inject=()=>{
         el.innerHTML='';
         el.appendChild(root);
+        this._applyUiTheme();
         this._renderSavedChips(); this._updateStatus(); this._renderScopeChips(); this._renderEmptyState();
         setTimeout(()=>root.querySelector('.ws-input')?.focus(),80);
         requestAnimationFrame(()=>{
@@ -2723,6 +3047,7 @@
       const target=wsPreviewLineLinkTarget(li,this._h().data);
       const menu=document.createElement('div');
       menu.className='ws-preview-ctx-menu';
+      menu.setAttribute('data-ws-theme',this._root?.getAttribute('data-ws-theme')||'system');
       const x=Math.min(e.clientX,typeof window!=='undefined'?window.innerWidth-220:e.clientX);
       const y=Math.min(e.clientY,typeof window!=='undefined'?window.innerHeight-120:e.clientY);
       menu.style.left=x+'px'; menu.style.top=y+'px';
@@ -2930,8 +3255,12 @@
   /** Load all collections + records needed for people + main index (null on failure). */
   async function wsPluginFetchCollectionsAndRecords(plugin, config) {
     let allCols;
-    try { allCols=await plugin.data.getAllCollections(); } catch(e) { console.error('[WorkflowSearch] collections error:',e); return null; }
-    const included=config.includedCollectionIds.length?allCols.filter(c=>config.includedCollectionIds.includes(c.getGuid())):allCols;
+    try { allCols=wsCoerceCollectionArray(await plugin.data.getAllCollections()); } catch(e) { console.error('[WorkflowSearch] collections error:',e); return null; }
+    let included=config.includedCollectionIds.length?allCols.filter(c=>config.includedCollectionIds.includes(c.getGuid())):allCols;
+    if (!included.length&&allCols.length&&config.includedCollectionIds.length) {
+      console.warn('[WorkflowSearch] includedCollectionIds matched no collections (stale or wrong workspace); indexing all collections instead.');
+      included=allCols;
+    }
     const needPeople=config.peopleCollectionGuid&&!included.find(c=>c.getGuid()===config.peopleCollectionGuid);
     const toFetch=needPeople?[...included,allCols.find(c=>c.getGuid()===config.peopleCollectionGuid)].filter(Boolean):included;
     let colData;
@@ -2979,6 +3308,7 @@
         this._searchPanelId=panel.getId();
         panel.setTitle('Search');
         const sp=new SearchPanel(this,panel,this._parser);
+        this._searchPanel=sp;
         sp.mount();
       });
 
@@ -3019,6 +3349,7 @@
       for (const id of (this._eventIds||[])) { try { this.events.off(id); } catch(e) {} }
       this._eventIds=[]; this._cmd?.remove?.(); this._sidebarItem?.remove?.();
       if (this._keyHandler) document.removeEventListener('keydown',this._keyHandler,true);
+      try { this._searchPanel?._disposeThemeWatchers(); } catch(e) {}
       if (_wsActiveHost===this) _wsActiveHost=null;
     }
 
@@ -3100,7 +3431,11 @@
 
     async _savePersisted(partial) {
       const prev=this._readMergedPersisted();
-      const next=wsNormalizePersist({ ...prev,...partial });
+      // Opportunistically mirror the local-only theme into the server blob so it rides along on any real save (cross-device sync).
+      const localTheme=wsReadLocalTheme();
+      const nextRaw={ ...prev,...partial };
+      if (localTheme) nextRaw.uiTheme=localTheme;
+      const next=wsNormalizePersist(nextRaw);
       const api=this.data.getPluginByGuid(this.getGuid());
       const shapes=wsWorkflowSearchPersistShapes(next);
       const fallbackLs=()=>{
@@ -3126,13 +3461,13 @@
     async _saveConfig(config) { await this._savePersisted(config); }
 
     _getEffectiveConfig() {
-      const raw=this._readMergedPersisted();
-      return {
-        includedCollectionIds:raw.includedCollectionIds,
-        tagPropName:raw.tagPropName,
-        peopleCollectionGuid:raw.peopleCollectionGuid,
-        peopleNameProp:raw.peopleNameProp,
-      };
+      const merged=wsNormalizePersist(this._readMergedPersisted());
+      // Theme read strategy: `localStorage` wins (fast, no reload). If LS is empty, adopt the server/LS blob value
+      // and mirror it into `localStorage` so this device behaves consistently from here on.
+      const localTheme=wsReadLocalTheme();
+      if (localTheme) merged.uiTheme=localTheme;
+      else if (merged.uiTheme==='dark'||merged.uiTheme==='light'||merged.uiTheme==='system') wsWriteLocalTheme(merged.uiTheme);
+      return merged;
     }
 
     _getSavedSearchesList() { return this._readMergedPersisted().savedSearches; }
@@ -3159,12 +3494,20 @@
 
       void this._buildBodyIndex();
 
-      if (this._searchPanelId) {
-        const panels=this.ui.getPanels()||[];
-        const sp=panels.find(p=>p.getId()===this._searchPanelId);
-        if (sp) this._notifyPanelRebuild(sp);
-      }
+      this._refreshSearchPanel();
       console.log(`[WorkflowSearch] v${WS_VERSION} · Index: ${this._index.size()} records, ${this._index.collectionCount()} collections · People: ${people.size()}`);
+
+      // Plugin-reload race: workspace data may not be hydrated yet on the first build after `saveConfiguration`.
+      // If `getAllCollections()` came back empty, retry a couple of times so the UI doesn't sit at "Building index…".
+      if (allCols.length===0) {
+        const attempts=(this._buildRetryCount||0)+1;
+        this._buildRetryCount=attempts;
+        if (attempts<=3) {
+          setTimeout(()=>{ void this._buildIndex(); }, 600*attempts);
+        }
+      } else {
+        this._buildRetryCount=0;
+      }
     }
 
     async _refreshBodyForRecord(record) {
@@ -3209,7 +3552,14 @@
       if (!sp) return;
       this._notifyPanelRebuild(sp);
       const input=sp.getElement()?.querySelector('.ws-input');
-      if (input&&input.value) input.dispatchEvent(new Event('input'));
+      if (input&&input.value) {
+        input.dispatchEvent(new Event('input'));
+        return;
+      }
+      // No active query — re-render the empty state so the big "Building index…" placeholder clears
+      // once the build is done (status bar is already updated by `_notifyPanelRebuild`).
+      const panel=this._searchPanel;
+      if (panel&&panel._root?.isConnected&&!panel._configMode) panel._renderEmptyState();
     }
 
     _notifyPanelRebuild(panel) {
