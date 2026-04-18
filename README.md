@@ -1,10 +1,10 @@
 # WorkflowSearch
 
-**Version 1.1.3**
+**Version 1.1.4**
 
 A Thymer **AppPlugin** that adds a persistent, panel-based search across your collections. It combines a local index (fast name + tag matching) with optional body text and the app’s `searchByQuery` API for text that is not yet indexed.
 
-**Current release (v1.1.3)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.3** adds **scope role tokens** in the search field — **`in:record:$wsR`**, **`in:col:$wsC`**, **`under:line:$wsL`** — with **`wsResolveScopeAliases`** / **`_scopeAliasResolved`** for execution, **full GUIDs** on **Save**, and **`wsQueryGuidsToScopeAliases`** when **loading** a saved search so chips restore tokens + map. Scope role tokens are substituted for the actual <guid> value.  This is to make the search query shorter and more readable.  **v1.1.2** improved **expand-row preview** (linked **record** / **collection** titles, fewer spurious lines, scope **@** badge rules) and **hybrid preview navigation** (**⌘/Ctrl+click** and **right-click** to open link targets, footer hint). **v1.1.1** added **` AND `**, **`under:line:`** fixes, merged **`searchByQuery` +** index body results, and a higher body index cap. It includes **v1.1.0** **`title:`** / **`body:`**, **v1.0.9** autocomplete / **⌃Space** saved searches, **exclude phrases**, dates, and **`searchByQuery` skip** when needed (see **Changelog**). Earlier: **v1.0.4+** People / **@-syntax**; **v1.0.5+** expandable previews; **v1.0.6–v1.0.7** mentions (badges, depth).
+**Current release (v1.1.4)** matches **`plugin.js`** (`WS_VERSION`), **`plugin.json`** (`custom.version`), and this document. **v1.1.4** adds a **cached merged persist read** (fewer `getConfiguration` calls; invalidated on **reload** and after saves), **debounced filter input** in the scope picker modal (~160 ms), **`SearchPanel`** UI split into **`SearchPanelResults`**, **`SearchPanelNavigate`**, **`SearchPanelAutocomplete`**, and **`SearchPanelScopeRow`**, and a **one-time migration** of **legacy `localStorage` saved searches** into **`custom.workflowSearch`** when the server blob is already meaningful but **`savedSearches`** is still empty (see **Configuration**). **v1.1.3** added **scope role tokens** — **`in:record:$wsR`**, **`in:col:$wsC`**, **`under:line:$wsL`** — with **`wsResolveScopeAliases`** / **`_scopeAliasResolved`**, **full GUIDs** on **Save**, and **`wsQueryGuidsToScopeAliases`** when loading a saved search. **v1.1.2** improved **expand-row preview** and **hybrid preview navigation**. **v1.1.1** added **` AND `**, **`under:line:`** fixes, merged **`searchByQuery` +** index body results, and a higher body index cap. See **Changelog** for full history.
 
 ## Contents
 
@@ -24,7 +24,7 @@ A Thymer **AppPlugin** that adds a persistent, panel-based search across your co
 - **Async** `searchByQuery` for plain terms/phrases when the query has **no** **`-word`** or **`-"phrase"`** text exclusions (otherwise the plugin uses the local index only so exclusions match **`nameLower` + `bodyLower`**). When `searchByQuery` runs, merges respect the same hashtag, completion, **date**, **exclude-phrase**, and person filters as the index.
 - **`is:completed` / `-is:completed`** filter by task completion (indexed from line items); optional **expand** preview lists matching tasks with nested indentation.
 - **People (@-syntax)** — optional **People collection** and name field in settings; resolve `@name`, `mentions:@name`, `fieldname:@name`, wildcards, and escaped `\@…` (see below). **v1.0.5+:** expand-row previews for **linked properties**, **mention lines**, or **tasks** depending on query (see **Expand preview**). **v1.0.6:** mentions lines show **@Name** badges per matched person (via `people.getDisplayName`); **v1.0.7:** mentions lines use **depth-based indentation** like task preview.
-- **Saved searches** stored in `localStorage` (`ws_saved_searches`), up to 12 entries.
+- **Saved searches** stored with panel settings in **`plugin.json` → `custom.workflowSearch`** (Thymer `saveConfiguration`), up to 12 entries. Legacy `localStorage` keys (`ws_saved_searches` / `ws_search_config`) are still read for merge and migration: if the server has **no** meaningful config yet, the full legacy blob is pushed to the server when `saveConfiguration` is available. If the server **already** has meaningful settings but **`savedSearches`** is empty while legacy LS still has chips, **v1.1.4** runs a **one-time** `saveConfiguration` that copies **only** those saved searches into the server JSON (then clears LS on success, same as other saves).
 - **Autocomplete:** After **`#`**, suggests indexed tags; after **`@`** at the end of the query (when People is configured), suggests people — including right after **`mentions:`** (e.g. **`mentions:@`**), after whitespace (e.g. **`foo @`**), or at the start of the box. **`@` is ignored for autocomplete** when a **word character** sits immediately before **`@`** (so **`user@`** is not treated as a person token). After **`:`** (alone or as in `is:`), suggests **`is:completed`**, **`-is:completed`**, **`created:`**, **`updated:`**, **`mentions:`**, **scope prefixes** (**`in:record:`**, **`in:col:`**, **`under:line:`**), and **`title:`** / **`body:`**; after **` or `** (lowercase), offers **` OR `**; after **` and `** (lowercase), offers **` AND `** (parser requires capital **`OR`** / **`AND`**); **⌃Space** (Ctrl+Space) opens **saved searches**. While suggestions are open, **↑↓** / **Enter** / **Esc** apply to the list (not the result list); see footer hint in the panel.
 - **Settings** (gear): included collections, **Hashtag property name**, and **People (@-syntax)** (People collection + optional name property).
 
@@ -88,7 +88,7 @@ Scope tokens are parsed **before** the rest of the query and apply to **all** **
 | `in:col:<guid>` | Only records in this **collection**. |
 | `in:record:<guid>` | Only this **record** (single note). |
 | `under:line:<guid>` | Only this **line’s subtree** (that line and descendants) for **text** matching; implicitly the record that owns the line. |
-| `in:col:$wsC` · `in:record:$wsR` · `under:line:$wsL` | **Alias** form after using the **Scope** picker or when **loading a saved search** (full GUIDs in storage are turned back into **`$ws…`** in the field and **`_scopeAliasResolved`** is filled). **`$wsC`**, **`$wsR`**, **`$wsL`** stand for the collection, note, or line GUID. **Saved searches** still store **expanded** GUIDs in `localStorage`. You can still paste **full** `in:record:…` / `under:line:…` / `in:col:…` tokens manually. |
+| `in:col:$wsC` · `in:record:$wsR` · `under:line:$wsL` | **Alias** form after using the **Scope** picker or when **loading a saved search** (full GUIDs in storage are turned back into **`$ws…`** in the field and **`_scopeAliasResolved`** is filled). **`$wsC`**, **`$wsR`**, **`$wsL`** stand for the collection, note, or line GUID. **Saved searches** still store **expanded** GUIDs in **`custom.workflowSearch.savedSearches`** (same blob as panel settings). You can still paste **full** `in:record:…` / `under:line:…` / `in:col:…` tokens manually. |
 
 The **filter** wizard walks **collection → note →** (whole note or heading line); it does **not** set **`in:col:`** by itself — you end with **`in:record:`** or **`under:line:`** unless you type **`in:col:`** manually.
 
@@ -169,7 +169,7 @@ Requires **People (@-syntax)** to be configured (People collection, optional nam
 
 Person tokens resolve to person **GUIDs** via the People index (exact name, or prefix when `*` is used). All of the above work inside **`A OR B`** groups.
 
-**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**), **`underScope`** / **`inRecordScope`** (subtree or whole-note lines). **`_renderResults`** builds **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted). **v1.1.2:** label helpers **`wsResolveGuidTargetTitle`**, **`wsPreviewLineLinkTarget`**; **`SearchPanel`** methods **`_onPreviewLineInteraction`**, **`_navigateToPreviewLinkTarget`**, **`_showPreviewLineMenu`**; scope line UI from **`wsCreateScopePreviewLineDiv`** (click + context menu). **v1.1.3:** **`wsResolveScopeAliases`**, **`wsQueryGuidsToScopeAliases`**, **`_scopeAliasResolved`**, **`_queryResolvedForParse()`** (see **Search scope**).
+**Implementation notes:** **`_loadPreviewFor(entry, previewContext, previewEl)`** selects **`previewContext.type`**: **`task`** (`wsFilterTaskLinesForPreview`), **`mentions`** (`wsForEachLineItemDeep`; **v1.0.6+** multi-person **`@Name`** badges via **`people.getDisplayName`**, **v1.0.7+** tree depth / same indent as tasks), **`property`** (`getAllProperties()` + `linkedRecords()`, optional field filter; **`PropName → PersonName`**), **`underScope`** / **`inRecordScope`** (subtree or whole-note lines). **`SearchPanelResults.render`** builds the result list and **`previewContext`** once per search. Property rows use **`.ws-preview-prop`** (blue-tinted). **v1.1.2:** label helpers **`wsResolveGuidTargetTitle`**, **`wsPreviewLineLinkTarget`**; **`SearchPanel`** **`_onPreviewLineInteraction`**, **`_showPreviewLineMenu`** (navigation delegates to **`SearchPanelNavigate`**); scope line UI from **`wsCreateScopePreviewLineDiv`** (click + context menu). **v1.1.3:** **`wsResolveScopeAliases`**, **`wsQueryGuidsToScopeAliases`**, **`_scopeAliasResolved`**, **`_queryResolvedForParse()`** (see **Search scope**).
 
 ## Keyboard
 
@@ -195,7 +195,11 @@ Person tokens resolve to person **GUIDs** via the People index (exact name, or p
   - **People collection** — dropdown: which collection holds your **people** records (used to build `PeopleIndex` at index time).
   - **Name property** — optional. **Blank** = match person names against each record’s **title**. If names live in another field, enter that **property name** here.
 
-Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_saveConfig` / `_getEffectiveConfig` in `plugin.js`).
+Settings and saved searches persist in **`plugin.json`** under **`custom.workflowSearch`** via Thymer’s **`PluginGlobalPluginAPI.saveConfiguration`** (`this.data.getPluginByGuid(this.getGuid())`). If that API is missing, the plugin falls back to `localStorage` (see `_savePersisted` in `plugin.js`).
+
+**Merge policy (server vs legacy LS):** On each read, the plugin prefers a **meaningful** normalized server blob (`_persistMeaningful` — e.g. included collections, People, non-default tag property, or any saved searches). If the server blob exists but is **not** meaningful, it **merges** legacy `localStorage` into the server shape so empty placeholders do not hide LS data. If the server **is** meaningful, that merged result is the source of truth for **settings**; **saved searches** on the server are still authoritative unless **`savedSearches`** is **empty** and legacy LS still has entries — then **`_maybeMigrateLocalStorageToPlugin`** (on load) performs the **one-time** copy described under **Features** above.
+
+**Read cache:** **`_readMergedPersisted`** keeps a normalized in-memory snapshot and returns a **deep clone** so callers cannot mutate the cache; the cache is cleared on **`reload`** and updated after each successful **`_savePersisted`**.
 
 ### Setup (People @-syntax)
 
@@ -214,6 +218,13 @@ Settings are persisted via the plugin’s save path (see `WorkflowSearch` `_save
 Each query calls **`SearchIndex._resolvePersonFilters(group)`** when the segment contains person or mention clauses: person names resolve against `PeopleIndex`; **`mentions:`** uses the reverse mention index; bare **`@name`** backlink filters scan record links via **`linkedRecords()`** and field-specific filters only inspect the named property.
 
 ## Changelog
+
+### 1.1.4
+
+- **Persist read cache** — Merged `custom.workflowSearch` + legacy LS is cached on **`Plugin`** after normalize; reads return **`JSON.parse(JSON.stringify(…))`**. Cache cleared on **`reload`**; refreshed after **`_savePersisted`**.
+- **Scope picker** — Filter input in the modal is **debounced** (~160 ms); **`rerenderAndFocus`** and closing the overlay clear the timer and still refresh the list immediately when needed.
+- **Code layout** — Panel helpers: **`SearchPanelResults`**, **`SearchPanelNavigate`**, **`SearchPanelAutocomplete`**, **`SearchPanelScopeRow`** (plus existing **`SearchPanelScope`**, **`SearchPanelConfig`**, **`SearchPanelSaved`**).
+- **One-time LS → server saved searches** — If the server blob is already **meaningful** but **`savedSearches`** is empty and legacy **`ws_saved_searches` / `ws_search_config`** still has saved entries, **`_maybeMigrateLocalStorageToPlugin`** calls **`_savePersisted({ savedSearches: … })`** once (requires `saveConfiguration`). Successful server save removes legacy LS keys as usual.
 
 ### 1.1.3
 
@@ -260,7 +271,7 @@ This section lists features first released under the **1.0.8** docs line (exclud
 
 - **`wsPersonPreviewFilter(parsed)`** — New helper (parallel to **`wsCompletionPreviewFilter`**) that gathers all **`personRefs`** and **`mentionRefs`** from the parsed query (including across **OR** groups). Returns **`null`** when no person preview applies.
 - **`_loadPreviewFor(entry, previewContext, previewEl)`** — Routes on **`previewContext.type`**: **`task`** (unchanged task-completion preview), **`mentions`** (line items with **`ref`/`mention`** to resolved person GUIDs; click navigates to **line + highlight**), **`property`** (**`getAllProperties()`** + **`linkedRecords()`**, filtered by GUIDs and optional field for **`fieldname:@name`**; **`PropName → PersonName`**; click opens **record** without line jump).
-- **`_renderResults`** — Builds **`previewContext`** before the row loop; resolves person GUIDs once; **`fieldFilter`** when all refs target the same field; **mixed** `mentions` + backlink uses **mentions** (line-level) display. Chevron on every row when the query includes **`@`**, **`fieldname:`**, **`mentions:`**, or task-completion tokens. Tooltips: “Preview mentions”, “Preview linked properties”, or “Preview matching tasks”.
+- **Result list / preview wiring** — Builds **`previewContext`** before the row loop; resolves person GUIDs once; **`fieldFilter`** when all refs target the same field; **mixed** `mentions` + backlink uses **mentions** (line-level) display. Chevron on every row when the query includes **`@`**, **`fieldname:`**, **`mentions:`**, or task-completion tokens. Tooltips: “Preview mentions”, “Preview linked properties”, or “Preview matching tasks”. *(In current code this lives in **`SearchPanelResults.render`**.)*
 - **CSS** — **`.ws-preview-prop`** for property preview rows (blue-tinted), distinct from task/mention line previews.
 
 ### 1.0.4
