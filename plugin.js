@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.5
+   * Version 1.1.5.1
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -35,7 +35,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.5';
+  const WS_VERSION = '1.1.5.1';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
@@ -1510,14 +1510,26 @@
       return null;
     }
 
+    /**
+     * Atomic rebuild: populate fresh maps first, then swap. If the caller passes an empty list we STILL
+     * swap (so unchecking all collections works), but `_buildIndex` never calls us with a transient empty —
+     * it guards the wipe on post-reload hydration races at its own level.
+     */
     build(colDataList) {
-      this._entries.clear(); this._colNames.clear(); this._mentionIndex.clear();
-      this._lineSubtreeLower.clear(); this._lineToRecordGuid.clear(); this._recordLineGuids.clear();
+      const entries=new Map(), colNames=new Map();
       for (const {col,records} of colDataList) {
         const cGuid=col.getGuid(),cName=col.getName();
-        this._colNames.set(cGuid,cName);
-        for (const record of records) this._entries.set(record.guid,this._makeEntry(record,cGuid,cName));
+        colNames.set(cGuid,cName);
+        for (const record of records) entries.set(record.guid,this._makeEntry(record,cGuid,cName));
       }
+      this._entries=entries;
+      this._colNames=colNames;
+      // Derived caches are rebuilt incrementally by the body index; clear them together so they can't leak
+      // references to records that no longer exist.
+      this._mentionIndex=new Map();
+      this._lineSubtreeLower=new Map();
+      this._lineToRecordGuid=new Map();
+      this._recordLineGuids=new Map();
     }
 
     upsert(record,collectionGuid) {
@@ -2119,41 +2131,83 @@
       host._syncPeopleDisabledWarning();
       host._root?.querySelector('.ws-config-btn')?.classList.add('ws-active');
       const body=host._root?.querySelector('.ws-body'); if (!body) return;
-      body.innerHTML=`<div class="ws-empty">${wsIcon('loader')} Loading…</div>`;
       const config=host._h()._getEffectiveConfig();
-      let allCols=[];
       let loadError=null;
+
+      // Required GUIDs — if all of these are present in the first (live ∪ cached) view we can render
+      // without any retry at all, which is the common steady-state case.
+      const requiredGuids=new Set();
+      if (config.peopleCollectionGuid) requiredGuids.add(config.peopleCollectionGuid);
+      for (const g of config.includedCollectionIds||[]) requiredGuids.add(g);
+
+      /** Build the merged `allCols` view from a `seen` map (live objects by GUID) + `_knownColNames`. */
+      const buildMerged=(seen)=>{
+        const out=[...seen.values()];
+        const known=host._h()._knownColNames;
+        if (known && known.size>0) {
+          for (const [guid,name] of known.entries()) {
+            if (!seen.has(guid)) out.push({ getGuid:()=>guid, getName:()=>name });
+          }
+        }
+        return out;
+      };
+
+      const seen=new Map();
+      // First attempt: do ONE live fetch and merge with cache so we can render instantly. No "Loading…"
+      // spinner in the steady state — the cache is already populated from `_doBuildIndex`.
       try {
-        allCols=wsCoerceCollectionArray(await host._h().data.getAllCollections(), 'settings');
+        const batch=wsCoerceCollectionArray(await host._h().data.getAllCollections(), 'settings');
+        for (const c of batch) { try { const g=c.getGuid(); if (g) seen.set(g, c); } catch(e) {} }
       } catch (e) {
         console.warn('[WorkflowSearch] settings: getAllCollections failed', e);
         loadError=e;
       }
       if (!host._configMode||!host._root?.isConnected) return;
+      let allCols=buildMerged(seen);
+      const liveGuids0=new Set([...seen.keys()]);
+      let usedIndexFallback=allCols.length>seen.size && (seen.size===0 || [...requiredGuids].some(g=>!liveGuids0.has(g)));
+
       body.innerHTML='';
 
       const colSection=document.createElement('div'); colSection.className='ws-config-section';
       const colTitle=document.createElement('div'); colTitle.className='ws-config-title'; colTitle.textContent='Collections to search'; colSection.appendChild(colTitle);
       const colList=document.createElement('div'); colList.className='ws-config-col-list';
-      for (const col of allCols) {
-        let guid='',name='';
-        try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
-        if (!guid) continue;
-        const included=!config.includedCollectionIds.length||config.includedCollectionIds.includes(guid);
-        const row=document.createElement('label'); row.className='ws-config-col-row';
-        const cb=document.createElement('input'); cb.type='checkbox'; cb.className='ws-config-cb'; cb.checked=included; cb.dataset.guid=guid;
-        const nameEl=document.createElement('span'); nameEl.textContent=name||guid;
-        row.appendChild(cb); row.appendChild(nameEl); colList.appendChild(row);
-      }
-      if (!allCols.length) {
-        const msg=document.createElement('div');
-        msg.style.cssText='padding:8px 14px;font-size:11px;color:var(--ws-muted);line-height:1.5';
-        msg.textContent=loadError
-          ? 'Could not load collections (see console). Try reopening settings.'
-          : 'No collections were returned by Thymer. Try reopening settings or reloading.';
-        colSection.appendChild(msg);
-      }
-      colSection.appendChild(colList); body.appendChild(colSection);
+      const colSyncMsg=document.createElement('div');
+      colSyncMsg.style.cssText='padding:6px 14px;font-size:11px;color:var(--ws-muted);line-height:1.5;font-style:italic';
+      colSyncMsg.style.display='none';
+
+      /** Re-render the collection checklist preserving the user's current check state. */
+      const renderColList=(cols,opts={})=>{
+        const checkedNow=new Set([...colList.querySelectorAll('.ws-config-cb:checked')].map(cb=>cb.dataset.guid));
+        // If we just opened, seed from the persisted config; otherwise keep the user's ticks as-is.
+        const initial=!colList.childElementCount;
+        colList.innerHTML='';
+        for (const col of cols) {
+          let guid='',name='';
+          try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
+          if (!guid) continue;
+          const included=initial
+            ? (!config.includedCollectionIds.length||config.includedCollectionIds.includes(guid))
+            : checkedNow.has(guid);
+          const row=document.createElement('label'); row.className='ws-config-col-row';
+          const cb=document.createElement('input'); cb.type='checkbox'; cb.className='ws-config-cb'; cb.checked=included; cb.dataset.guid=guid;
+          const nameEl=document.createElement('span'); nameEl.textContent=name||guid;
+          row.appendChild(cb); row.appendChild(nameEl); colList.appendChild(row);
+        }
+        if (!cols.length) {
+          colSyncMsg.style.display=''; colSyncMsg.style.fontStyle='';
+          colSyncMsg.textContent=loadError
+            ? 'Could not load collections (see console). Try reopening settings.'
+            : 'No collections were returned by Thymer. Try reopening settings or reloading.';
+        } else if (opts.fallback) {
+          colSyncMsg.style.display=''; colSyncMsg.style.fontStyle='italic';
+          colSyncMsg.textContent='Showing cached collection list — workspace still syncing. The list will update automatically.';
+        } else {
+          colSyncMsg.style.display='none';
+        }
+      };
+      renderColList(allCols, { fallback: usedIndexFallback });
+      colSection.appendChild(colSyncMsg); colSection.appendChild(colList); body.appendChild(colSection);
       body.appendChild(Object.assign(document.createElement('div'),{className:'ws-config-divider'}));
 
       const tagSection=document.createElement('div'); tagSection.className='ws-config-section';
@@ -2170,22 +2224,29 @@
       const peopleColField=document.createElement('div'); peopleColField.className='ws-config-field';
       const peopleColLabel=document.createElement('span'); peopleColLabel.className='ws-config-field-label'; peopleColLabel.textContent='Collection:';
       const peopleSel=document.createElement('select'); peopleSel.className='ws-config-select';
-      const noneOpt=document.createElement('option'); noneOpt.value=''; noneOpt.textContent='— disabled —'; peopleSel.appendChild(noneOpt);
-      let peopleCurrentFound=false;
-      for (const col of allCols) {
-        let guid='',name='';
-        try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
-        if (!guid) continue;
-        const o=document.createElement('option'); o.value=guid; o.textContent=name||guid;
-        if (guid===config.peopleCollectionGuid) { o.selected=true; peopleCurrentFound=true; }
-        peopleSel.appendChild(o);
-      }
-      if (config.peopleCollectionGuid&&!peopleCurrentFound) {
-        const o=document.createElement('option'); o.value=config.peopleCollectionGuid;
-        o.textContent=`(unknown collection: ${config.peopleCollectionGuid.slice(0,8)}…)`;
-        o.selected=true;
-        peopleSel.appendChild(o);
-      }
+
+      /** Re-render the People dropdown, preserving the current selection when possible. */
+      const renderPeopleSel=(cols)=>{
+        const prevValue=peopleSel.value || config.peopleCollectionGuid || '';
+        peopleSel.innerHTML='';
+        const noneOpt=document.createElement('option'); noneOpt.value=''; noneOpt.textContent='— disabled —'; peopleSel.appendChild(noneOpt);
+        let currentFound=false;
+        for (const col of cols) {
+          let guid='',name='';
+          try { guid=col.getGuid(); name=col.getName(); } catch (e) { continue; }
+          if (!guid) continue;
+          const o=document.createElement('option'); o.value=guid; o.textContent=name||guid;
+          if (guid===prevValue) { o.selected=true; currentFound=true; }
+          peopleSel.appendChild(o);
+        }
+        if (prevValue && !currentFound) {
+          const o=document.createElement('option'); o.value=prevValue;
+          o.textContent=`(unknown collection: ${prevValue.slice(0,8)}…)`;
+          o.selected=true;
+          peopleSel.appendChild(o);
+        }
+      };
+      renderPeopleSel(allCols);
       peopleColField.appendChild(peopleColLabel); peopleColField.appendChild(peopleSel); peopleSection.appendChild(peopleColField);
 
       const peopleNameField=document.createElement('div'); peopleNameField.className='ws-config-field';
@@ -2213,6 +2274,41 @@
       }
       themeField.appendChild(themeLabel); themeField.appendChild(themeSel); themeSection.appendChild(themeField);
       body.appendChild(themeSection);
+
+      // Background refresh: only if the first merged view (live ∪ cache) is still missing something
+      // required, poll `getAllCollections()` briefly and re-render the checklist + People dropdown in
+      // place. The panel is already rendered, so the user never sees a "Loading…" spinner.
+      const firstMergedGuids=new Set([...seen.keys(), ...(host._h()._knownColNames?.keys?.()||[])]);
+      const missingAny=[...requiredGuids].some(g=>!firstMergedGuids.has(g));
+      if (missingAny || seen.size===0) {
+        (async()=>{
+          let prev=seen.size;
+          for (let attempt=0; attempt<6; attempt++) {
+            await new Promise(r=>setTimeout(r, 200+attempt*150));
+            if (!host._configMode||!host._root?.isConnected) return;
+            let batch=[];
+            try { batch=wsCoerceCollectionArray(await host._h().data.getAllCollections(), 'settings-bg'); } catch(e) {}
+            if (!host._configMode||!host._root?.isConnected) return;
+            let grew=false;
+            for (const c of batch) {
+              try { const g=c.getGuid(); if (g && !seen.has(g)) { seen.set(g, c); grew=true; } else if (g) seen.set(g, c); } catch(e) {}
+            }
+            const mergedNow=buildMerged(seen);
+            const mergedGuids=new Set(mergedNow.map(c=>{ try { return c.getGuid(); } catch(e) { return null; } }).filter(Boolean));
+            const stillMissing=[...requiredGuids].some(g=>!mergedGuids.has(g));
+            const fallbackNow=mergedNow.length>seen.size && (seen.size===0 || [...requiredGuids].some(g=>!seen.has(g)));
+            if (grew || mergedNow.length!==allCols.length) {
+              allCols=mergedNow;
+              usedIndexFallback=fallbackNow;
+              renderColList(allCols, { fallback: fallbackNow });
+              renderPeopleSel(allCols);
+            }
+            if (!stillMissing && seen.size>0 && seen.size===prev && attempt>=2) break; // stable
+            if (!stillMissing && seen.size>0) break;
+            prev=seen.size;
+          }
+        })();
+      }
 
       const actions=document.createElement('div'); actions.className='ws-config-actions';
       const cancelBtn=document.createElement('button'); cancelBtn.className='ws-btn ws-btn-secondary'; cancelBtn.textContent='Close'; cancelBtn.addEventListener('click',()=>SearchPanelConfig.close(host));
@@ -2251,9 +2347,11 @@
         }
 
         await host._h()._saveConfig(partial);
-        // `saveConfiguration` reloads the plugin; the panel may have been remounted under a new SearchPanel.
+        // `saveConfiguration` triggers a syncer `reload` event; our reload handler rebuilds the index.
+        // We only close the settings UI here and re-run the active query — no manual `_buildIndex` call
+        // (a duplicate rebuild would race the reload-handler rebuild and could wipe the fresh index
+        // if `getAllCollections()` is transiently empty during the syncer hand-off).
         if (host._root?.isConnected) SearchPanelConfig.close(host);
-        await host._h()._buildIndex();
         if (host._root?.isConnected && host._query) host._search(host._query);
       });
       actions.appendChild(cancelBtn); actions.appendChild(saveBtn); body.appendChild(actions);
@@ -3301,6 +3399,7 @@
       this._index=new SearchIndex(); this._parser=new QueryParser();
       this._searchPanelId=null; this._eventIds=[]; this._includedGuids=new Set();
       this._wsPersistMergedCache=null;
+      this._knownColNames=new Map();
 
       this.ui.injectCSS(WS_CSS);
 
@@ -3340,8 +3439,13 @@
             if (record) { this._index.upsert(record,ev.collectionGuid); void this._refreshBodyForRecord(record); }
           }
         }),
+        // Workspace collection changes: refresh our `_knownColNames` cache so the Settings panel
+        // can always resolve GUID → name, and trigger a rebuild so search results stay current.
+        // Crucial right after a `reload` where workspace data arrives asynchronously.
+        this.events.on('collection.created',(ev)=>{ void this._captureCollectionFromEvent(ev); void this._buildIndex(); }),
+        this.events.on('collection.updated',(ev)=>{ void this._captureCollectionFromEvent(ev); void this._buildIndex(); }),
         this.events.on('panel.closed',(ev)=>{ if (ev.panel.getId()===this._searchPanelId) this._searchPanelId=null; }),
-        this.events.on('reload',async()=>{ this._wsPersistMergedCache=null; await this._buildIndex(); })
+        this.events.on('reload',()=>{ this._wsPersistMergedCache=null; void this._buildIndex(); })
       );
     }
 
@@ -3349,6 +3453,7 @@
       for (const id of (this._eventIds||[])) { try { this.events.off(id); } catch(e) {} }
       this._eventIds=[]; this._cmd?.remove?.(); this._sidebarItem?.remove?.();
       if (this._keyHandler) document.removeEventListener('keydown',this._keyHandler,true);
+      if (this._buildRetryTimer) { clearTimeout(this._buildRetryTimer); this._buildRetryTimer=null; }
       try { this._searchPanel?._disposeThemeWatchers(); } catch(e) {}
       if (_wsActiveHost===this) _wsActiveHost=null;
     }
@@ -3474,40 +3579,92 @@
 
     async _saveSavedSearches(list) { await this._savePersisted({ savedSearches:list }); }
 
-    async _buildIndex() {
+    /**
+     * Serialized index build.
+     *
+     * Post-save and post-`reload` can both trigger builds concurrently, and `getAllCollections()` can
+     * return transiently empty while the syncer is settling. Guarantees:
+     *   - Only ONE `_doBuildIndex` runs at a time (others are coalesced into a single pending rerun).
+     *   - A transient empty fetch (0 collections from `getAllCollections`) never wipes a healthy index;
+     *     we schedule a retry and leave the current index intact (so the UI doesn't flash "Building index…").
+     */
+    _buildIndex() {
+      if (this._buildInFlight) { this._buildPending=true; return this._buildInFlight; }
+      const run=(async()=>{
+        try {
+          do {
+            this._buildPending=false;
+            await this._doBuildIndex();
+          } while (this._buildPending);
+        } finally {
+          this._buildInFlight=null;
+        }
+      })();
+      this._buildInFlight=run;
+      return run;
+    }
+
+    async _doBuildIndex() {
       const config=this._getEffectiveConfig();
       this._index.setTagPropName(config.tagPropName);
       const pack=await wsPluginFetchCollectionsAndRecords(this, config);
       if (!pack) return;
       const { allCols, included, colData }=pack;
 
-      // Build people index
+      // Transient empty: workspace data not yet hydrated after a `reload`/`saveConfiguration`. Keep the
+      // current index so the user keeps seeing real results, and schedule a retry via `_scheduleBuildRetry`.
+      if (allCols.length===0) {
+        this._scheduleBuildRetry();
+        return;
+      }
+      this._buildRetryCount=0;
+
       const people=new PeopleIndex();
       people.configure(config.peopleCollectionGuid,config.peopleNameProp);
       people.build(allCols,colData);
       this._index.setPeople(people);
 
-      // Build main index (only included collections — not the people-only extra fetch)
       this._includedGuids=new Set(included.map(c=>c.getGuid()));
       const searchColData=colData.filter(d=>this._includedGuids.has(d.col.getGuid()));
       this._index.build(searchColData);
+
+      // Remember every workspace collection name we have seen (including People if it is not one of
+      // the included/search collections) on the Plugin so the Settings panel can still resolve GUIDs →
+      // names during a syncer hand-off when `getAllCollections()` returns partial data. Stored on the
+      // Plugin (not `SearchIndex._colNames`) so the status-bar `collectionCount()` stays scoped to
+      // indexed collections only.
+      if (!this._knownColNames) this._knownColNames=new Map();
+      for (const col of allCols) {
+        try { const g=col.getGuid(), n=col.getName(); if (g) this._knownColNames.set(g, n||''); } catch(e) {}
+      }
 
       void this._buildBodyIndex();
 
       this._refreshSearchPanel();
       console.log(`[WorkflowSearch] v${WS_VERSION} · Index: ${this._index.size()} records, ${this._index.collectionCount()} collections · People: ${people.size()}`);
+    }
 
-      // Plugin-reload race: workspace data may not be hydrated yet on the first build after `saveConfiguration`.
-      // If `getAllCollections()` came back empty, retry a couple of times so the UI doesn't sit at "Building index…".
-      if (allCols.length===0) {
-        const attempts=(this._buildRetryCount||0)+1;
-        this._buildRetryCount=attempts;
-        if (attempts<=3) {
-          setTimeout(()=>{ void this._buildIndex(); }, 600*attempts);
-        }
-      } else {
-        this._buildRetryCount=0;
-      }
+    /** Capture collection name from a collection.* event so `_knownColNames` stays complete even if `getAllCollections()` is partial. */
+    _captureCollectionFromEvent(ev) {
+      try {
+        const guid=ev?.collectionGuid; if (!guid) return;
+        if (!this._knownColNames) this._knownColNames=new Map();
+        // Re-query by guid for the current name; fall back to retaining the existing name.
+        const col=typeof this.data?.getCollection==='function'?this.data.getCollection(guid):null;
+        let name='';
+        if (col) { try { name=col.getName()||''; } catch(e) {} }
+        if (!name && this._knownColNames.has(guid)) return;
+        this._knownColNames.set(guid, name);
+      } catch(e) {}
+    }
+
+    _scheduleBuildRetry() {
+      const attempts=(this._buildRetryCount||0)+1;
+      this._buildRetryCount=attempts;
+      if (attempts>6) { console.warn('[WorkflowSearch] build retry giving up after 6 attempts'); return; }
+      const delay=Math.min(400*attempts, 3000);
+      clearTimeout(this._buildRetryTimer);
+      this._buildRetryTimer=setTimeout(()=>{ this._buildRetryTimer=null; void this._buildIndex(); }, delay);
     }
 
     async _refreshBodyForRecord(record) {
