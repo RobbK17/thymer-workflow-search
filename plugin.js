@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.6.1
+   * Version 1.1.7
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -23,6 +23,8 @@
    *   -"phrase"       → exclude records whose title+body contain phrase
    *   created: / updated: → filter by record date (local calendar day; see README)
    *   in:record: / in:col: / under:line: → GUID-backed scope (see README; filter picker)
+   *   has:link / -has:link → body outline or properties contain a link (URL, ref, embed) / must not
+   *   has:attachment / -has:attachment → body or file/image properties have an attachment / must not
    *   title: / body: → restrict text terms to record name or body (segment prefix)
    *   : (after word or alone) → autocomplete is: / created: / updated: / mentions: / in: / under:
    *
@@ -35,7 +37,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.6.1';
+  const WS_VERSION = '1.1.7';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
@@ -190,6 +192,10 @@
     { label:'under:line:…', insert:'under:line:', detail:'subtree under a heading — use Scope' },
     { label:'title: …', insert:'title: ', detail:'restrict text terms to record title only' },
     { label:'body: …', insert:'body: ', detail:'restrict text terms to record body only' },
+    { label:'has:link', insert:'has:link', detail:'outline or property has URL / link / embed' },
+    { label:'-has:link', insert:'-has:link', detail:'no links in body or link-like properties' },
+    { label:'has:attachment', insert:'has:attachment', detail:'image/file/media line or file property' },
+    { label:'-has:attachment', insert:'-has:attachment', detail:'no file/image/media attachments' },
   ];
 
   function wsAcColonOpsMatch(prefix) {
@@ -648,6 +654,87 @@
     if (isCompleted===false) return entry.hasOpenTask===true;
     return true;
   }
+  /** @param {null|boolean|undefined} want — null: no filter; true: must have; false: must not (`-has:link`) */
+  function wsMatchesHasLinkFilter(entry,want) {
+    if (want===null||want===undefined) return true;
+    if (entry.hasLink===undefined) return false;
+    if (want===true) return entry.hasLink===true;
+    if (want===false) return entry.hasLink===false;
+    return true;
+  }
+  /** @param {null|boolean|undefined} want — null: no filter; true: must have; false: must not (`-has:attachment`) */
+  function wsMatchesHasAttachmentFilter(entry,want) {
+    if (want===null||want===undefined) return true;
+    if (entry.hasAttachment===undefined) return false;
+    if (want===true) return entry.hasAttachment===true;
+    if (want===false) return entry.hasAttachment===false;
+    return true;
+  }
+
+  /** Segment types counted for `has:link` (URLs, outline refs, @mentions). */
+  const WS_HAS_LINK_SEGMENT_TYPES=new Set(['link','linkobj','url','bookmark','hyperlink','ref','mention']);
+  /** Line item types counted as links (embeds / transclusion / collection & plugin links). */
+  const WS_HAS_LINK_LINE_TYPES=new Set(['ref','document','app','gplugin','transclusion']);
+  const WS_HAS_ATTACHMENT_LINE_TYPES=new Set(['image','file','media']);
+
+  function wsLineItemContributesHasLink(li) {
+    try {
+      if (WS_HAS_LINK_LINE_TYPES.has(li.type)) return true;
+      for (const seg of li.segments||[]) {
+        const st=String(seg&&seg.type||'').toLowerCase();
+        if (WS_HAS_LINK_SEGMENT_TYPES.has(st)) return true;
+      }
+    } catch(e) {}
+    return false;
+  }
+  function wsLineItemContributesHasAttachment(li) {
+    try { if (WS_HAS_ATTACHMENT_LINE_TYPES.has(li.type)) return true; } catch(e) {}
+    return false;
+  }
+
+  /** URL / record-link / file detection on `PluginProperty` values (best-effort; matches SDK property shapes). */
+  async function wsScanRecordPropertiesForLinkAttachment(record) {
+    let hasLink=false,hasAttachment=false;
+    try {
+      const props=record.getAllProperties();
+      for (const p of props) {
+        try {
+          const lr=p.linkedRecords();
+          if (lr&&lr.length) hasLink=true;
+        } catch(e) {}
+        try {
+          const tx=p.texts();
+          if (tx&&tx.some(t=>t&&/^https?:\/\//i.test(String(t).trim()))) hasLink=true;
+        } catch(e) {}
+        try {
+          const fs=p.files();
+          if (fs&&fs.length) hasAttachment=true;
+        } catch(e) {}
+        try { if (p.file&&p.file()) hasAttachment=true; } catch(e) {}
+        try {
+          if (typeof p.fileBlob==='function') {
+            const b=await p.fileBlob();
+            if (b) hasAttachment=true;
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+    return { hasLink,hasAttachment };
+  }
+
+  async function wsComputeLinkAttachment(record,flatLineItems) {
+    let hasLink=false,hasAttachment=false;
+    for (const li of flatLineItems||[]) {
+      if (wsLineItemContributesHasAttachment(li)) hasAttachment=true;
+      if (wsLineItemContributesHasLink(li)) hasLink=true;
+      if (hasLink&&hasAttachment) break;
+    }
+    const prop=await wsScanRecordPropertiesForLinkAttachment(record);
+    return {
+      hasLink:hasLink||prop.hasLink,
+      hasAttachment:hasAttachment||prop.hasAttachment,
+    };
+  }
 
   /** YYYY-MM-DD → local start-of-day ms */
   function wsDayStartMs(ymd) {
@@ -912,6 +999,17 @@
       };
     }
     return null;
+  }
+
+  /**
+   * When the user opens **`:`** autocomplete right after **`OR`** / **`AND`** without a trailing space,
+   * inserting **`has:…`** must not produce **`ORhas:link`**. Prefix the insert with **` `** in that case.
+   */
+  function wsAcNeedsSpaceBeforeHasInsert(preReplaceSlice) {
+    const pre=String(preReplaceSlice||'');
+    if (/\s$/.test(pre)) return false;
+    const base=pre.trimEnd();
+    return /\b(OR|AND)$/i.test(base);
   }
 
   function wsSortSearchResultsByCollectionTitle(entries) {
@@ -1423,7 +1521,7 @@
     _parseSegment(raw) {
       if (raw === undefined || raw === null) return null;
       if (!String(raw).trim()) {
-        return { includeTags:[],excludeTags:[],phrases:[],excludePhrases:[],excludeTerms:[],terms:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null},textScope:'both' };
+        return { includeTags:[],excludeTags:[],phrases:[],excludePhrases:[],excludeTerms:[],terms:[],isCompleted:null,hasLink:null,hasAttachment:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null},textScope:'both' };
       }
       let s=String(raw).trim();
       let textScope='both';
@@ -1436,10 +1534,18 @@
       const personRefs=[];      // { token, wildcard, mode:'backlink'|'field', field:string|null }
       const mentionRefs=[];     // { token, wildcard }
       let isCompleted=null;
+      let hasLink=null,hasAttachment=null;
 
       // is:completed / -is:completed
       if (/\-is:completed\b/.test(s))  { isCompleted=false; s=s.replace(/-is:completed\b/g,' '); }
       if (/\bis:completed\b/.test(s))  { isCompleted=true;  s=s.replace(/\bis:completed\b/g,' '); }
+
+      // has:attachment / -has:attachment (before has:link so `has:` patterns don’t clash)
+      if (/\-has:attachment\b/.test(s)) { hasAttachment=false; s=s.replace(/-has:attachment\b/g,' '); }
+      if (/\bhas:attachment\b/.test(s)) { hasAttachment=true; s=s.replace(/\bhas:attachment\b/g,' '); }
+      // has:link / -has:link — strip negative form before positive `has:link`
+      if (/\-has:link\b/.test(s)) { hasLink=false; s=s.replace(/-has:link\b/g,' '); }
+      if (/\bhas:link\b/.test(s)) { hasLink=true; s=s.replace(/\bhas:link\b/g,' '); }
 
       // created: / updated: (date filters; values stripped before text parse)
       const dateFilters={ created:null,updated:null };
@@ -1502,10 +1608,11 @@
       const hasDate=(dateFilters.created!=null&&!dateFilters.created.empty)||(dateFilters.updated!=null&&!dateFilters.updated.empty);
       const isEmpty=!includeTags.length&&!excludeTags.length&&!phrases.length&&
         !excludeTerms.length&&!excludePhrases.length&&!terms.length&&isCompleted===null&&
+        hasLink===null&&hasAttachment===null&&
         !personRefs.length&&!mentionRefs.length&&!hasDate;
       if (isEmpty) return null;
 
-      return { includeTags,excludeTags,phrases,excludePhrases,excludeTerms,terms,isCompleted,personRefs,mentionRefs,dateFilters,textScope };
+      return { includeTags,excludeTags,phrases,excludePhrases,excludeTerms,terms,isCompleted,hasLink,hasAttachment,personRefs,mentionRefs,dateFilters,textScope };
     }
   }
 
@@ -1625,7 +1732,7 @@
       for (const m of [...name.matchAll(/#([^\s#]+)/g)]) { const t=wsNormalizeTagToken(m[1]); if (!tags.includes(t)) tags.push(t); }
       const displayName=name.replace(/#[^\s#]+/g,'').replace(/\s{2,}/g,' ').trim()||name;
       const times=wsRecordTimeFields(record);
-      return { guid:record.guid,name,displayName,nameLower:name.toLowerCase(),tags,collectionGuid,collectionName,record,createdMs:times.createdMs,updatedMs:times.updatedMs };
+      return { guid:record.guid,name,displayName,nameLower:name.toLowerCase(),tags,collectionGuid,collectionName,record,createdMs:times.createdMs,updatedMs:times.updatedMs,hasLink:false,hasAttachment:false };
     }
 
     /** Add person mention (ref segment) during body indexing. */
@@ -1653,6 +1760,13 @@
       entry.hasAnyTask=stats.hasAnyTask;
       entry.hasOpenTask=stats.hasOpenTask;
       entry.hasCompletedTask=stats.hasCompletedTask;
+    }
+
+    updateLinkAttachment(guid,stats) {
+      const entry=this._entries.get(guid);
+      if (!entry) return;
+      entry.hasLink=!!stats.hasLink;
+      entry.hasAttachment=!!stats.hasAttachment;
     }
 
     matchesParsedEntryFilters(entry,parsed) {
@@ -1687,6 +1801,8 @@
       if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) return false;
       if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) return false;
       if (!wsMatchesCompletionFilter(entry,group.isCompleted)) return false;
+      if (!wsMatchesHasLinkFilter(entry,group.hasLink)) return false;
+      if (!wsMatchesHasAttachmentFilter(entry,group.hasAttachment)) return false;
       const df=group.dateFilters;
       if (!wsEntryMatchesDateFilters(entry,df||null)) return false;
       const excludeTerms=group.excludeTerms||[],excludePhrases=group.excludePhrases||[];
@@ -1827,7 +1943,7 @@
     }
 
     _filterGroupWithBody(group,limit,parsed) {
-      const {includeTags,excludeTags,phrases,excludeTerms,excludePhrases=[],terms,isCompleted=null,dateFilters,textScope:tsRaw}=group;
+      const {includeTags,excludeTags,phrases,excludeTerms,excludePhrases=[],terms,isCompleted=null,hasLink=null,hasAttachment=null,dateFilters,textScope:tsRaw}=group;
       const ts=tsRaw||'both';
       const nameMatches=[],bodyMatches=[];
       const scope=parsed&&parsed.scope?parsed.scope:{};
@@ -1845,6 +1961,8 @@
         if (includeTags.length&&!includeTags.every(t=>wsTagQueryMatches(t,entry.tags))) continue;
         if (excludeTags.some(t=>wsTagExcludeMatches(t,entry.tags))) continue;
         if (!wsMatchesCompletionFilter(entry,isCompleted)) continue;
+        if (!wsMatchesHasLinkFilter(entry,hasLink)) continue;
+        if (!wsMatchesHasAttachmentFilter(entry,hasAttachment)) continue;
         if (!wsEntryMatchesDateFilters(entry,dateFilters||null)) continue;
 
         const underLine=scope.underLineGuid;
@@ -2782,8 +2900,11 @@
       } else if (ctx.type==='and') {
         items.push({ kind:'and', kindLabel:'AND', label:'Use AND (intersection)', replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:' AND ' });
       } else if (ctx.type==='colon') {
+        const needsSpaceBeforeHas=wsAcNeedsSpaceBeforeHasInsert(v.slice(0,ctx.replaceStart));
         for (const op of wsAcColonOpsMatch(ctx.prefix)) {
-          items.push({ kind:'colon', kindLabel:':', label:op.label, detail:op.detail, replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:op.insert });
+          let ins=op.insert;
+          if (/^-?has:/.test(ins) && needsSpaceBeforeHas) ins=' '+ins;
+          items.push({ kind:'colon', kindLabel:':', label:op.label, detail:op.detail, replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:ins });
         }
       } else if (ctx.type==='tag') {
         const all=host._h()._index.getAllTagsSorted();
@@ -2876,7 +2997,7 @@
       const doNav=async(panel)=>{
         panel.navigateTo({type:'edit_panel',rootId:entry.record.guid,workspaceGuid:host._h().getWorkspaceGuid()});
         host._h().ui.setActivePanel(panel);
-        const plainQuery=host._toPlainQuery(host._parser.parse(host._queryResolvedForParse())||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],excludePhrases:[],isCompleted:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null}});
+        const plainQuery=host._toPlainQuery(host._parser.parse(host._queryResolvedForParse())||{type:'and',terms:[],phrases:[],includeTags:[],excludeTags:[],excludeTerms:[],excludePhrases:[],isCompleted:null,hasLink:null,hasAttachment:null,personRefs:[],mentionRefs:[],dateFilters:{created:null,updated:null}});
         if (!plainQuery) return;
         try {
           const lineItems=await Promise.race([entry.record.getLineItems(false),new Promise(r=>setTimeout(()=>r([]),3000))]);
@@ -3414,7 +3535,7 @@
       if (!body||this._configMode) return;
       const count=this._h()._index.size();
       if (count>0) {
-        body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._h()._index.collectionCount()} collection${this._h()._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; -"phrase" &nbsp; use OR (capital) for union<br>@person &nbsp; ⌃Space saved &nbsp; · &nbsp; filter button &nbsp; in:/under: &nbsp; · &nbsp; autocomplete: # &nbsp; @ &nbsp; : &nbsp; or→OR<br>title: / body: &nbsp; · &nbsp; is:completed &nbsp; -is:completed &nbsp; created: &nbsp; updated: &nbsp; mentions:</div></div>`;
+        body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('search')}</div><div>Search ${count.toLocaleString()} records across ${this._h()._index.collectionCount()} collection${this._h()._index.collectionCount()!==1?'s':''}</div><div class="ws-empty-hint">#tag &nbsp; -#tag &nbsp; "phrase" &nbsp; -term &nbsp; -"phrase" &nbsp; use OR (capital) for union<br>@person &nbsp; ⌃Space saved &nbsp; · &nbsp; filter button &nbsp; in:/under: &nbsp; · &nbsp; autocomplete: # &nbsp; @ &nbsp; : &nbsp; or→OR<br>title: / body: &nbsp; · &nbsp; is:completed &nbsp; -is:completed &nbsp; has:link &nbsp; -has:link &nbsp; has:attachment &nbsp; -has:attachment &nbsp; created: &nbsp; updated: &nbsp; mentions:</div></div>`;
       } else {
         body.innerHTML=`<div class="ws-empty"><div class="ws-empty-icon">${wsIcon('loader')}</div><div>Building index…</div></div>`;
       }
@@ -3499,6 +3620,8 @@
           plugin._extractMentions(entry.guid,flat);
           const stats=await wsComputeTaskCompletion(entry.record,flat);
           plugin._index.updateTaskCompletion(entry.guid,stats);
+          const la=await wsComputeLinkAttachment(entry.record,flat);
+          plugin._index.updateLinkAttachment(entry.guid,la);
         } catch(e) {}
       }));
       await new Promise(r=>setTimeout(r,0));
@@ -3869,6 +3992,8 @@
         this._extractMentions(record.guid,flat);
         const stats=await wsComputeTaskCompletion(record,flat);
         this._index.updateTaskCompletion(record.guid,stats);
+        const la=await wsComputeLinkAttachment(record,flat);
+        this._index.updateLinkAttachment(record.guid,la);
         this._refreshSearchPanel();
       } catch(e) {}
     }
