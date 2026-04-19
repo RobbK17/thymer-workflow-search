@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.6
+   * Version 1.1.6.1
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -35,7 +35,7 @@
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.6';
+  const WS_VERSION = '1.1.6.1';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
@@ -547,6 +547,14 @@
     const n=String(name||'').trim().replace(/^ti-/,'');
     if (!n||!/^[a-z][a-z0-9-]*$/.test(n)) return '';
     return `<i class="ti ti-${n}" aria-hidden="true"></i>`;
+  }
+  // Single source of truth for the status-bar HTML. `index` is a SearchIndex instance.
+  function wsFormatIndexStatusBarHtml(index) {
+    const rCount=index.size(),cCount=index.collectionCount(),pCount=index._people.size();
+    const pStr=pCount>0?` · ${pCount} people`:'';
+    return rCount>0
+      ?`<span class="ws-status-dot"></span>${cCount} collection${cCount!==1?'s':''} · ${rCount.toLocaleString()} records${pStr}`
+      :`<span class="ws-status-dot ws-building"></span>Building index…`;
   }
   function wsNormalizeTagToken(tok) {
     return String(tok||'').toLowerCase().trim()
@@ -1300,16 +1308,20 @@
       this._guidToName = new Map(); // guid → displayName
       this._colGuid = null;
       this._nameProp = null;        // null = use record title
+      // Memoized name-sorted suggestion list; invalidated whenever `_records` is cleared/rebuilt in `build()`.
+      this._sortedSuggestCache = null;
     }
 
     configure(colGuid, nameProp) {
       this._colGuid = colGuid || null;
       this._nameProp = nameProp || null;
+      this._sortedSuggestCache = null;
     }
 
     build(allCollections, allColData) {
       this._records.clear();
       this._guidToName.clear();
+      this._sortedSuggestCache = null;
       if (!this._colGuid) return;
       const col = allCollections.find(c => c.getGuid() === this._colGuid);
       if (!col) return;
@@ -1349,18 +1361,31 @@
     isConfigured()       { return !!this._colGuid; }
     size()               { return this._records.size; }
 
+    /** Full suggestion list, name-sorted; computed once per `build()` / `configure()`. */
+    _allSuggestionsSorted() {
+      if (this._sortedSuggestCache) return this._sortedSuggestCache;
+      const out=[];
+      for (const [key,rec] of this._records) {
+        const label=this._guidToName.get(rec.guid)||key;
+        out.push({ key, label, insert:'@'+key });
+      }
+      out.sort((a,b)=>String(a.label).localeCompare(String(b.label),undefined,{sensitivity:'base'}));
+      return (this._sortedSuggestCache=out);
+    }
+
     /** @param prefix lowercased partial after @ */
     suggestByPrefix(prefix,limit=30) {
       const p=String(prefix||'').toLowerCase();
+      const all=this._allSuggestionsSorted();
+      if (!p) return all.slice(0,limit);
       const out=[];
-      for (const [key,rec] of this._records) {
-        if (!p||key.startsWith(p)) {
-          const label=this._guidToName.get(rec.guid)||key;
-          out.push({ key, label, insert:'@'+key });
+      for (const item of all) {
+        if (item.key.startsWith(p)) {
+          out.push(item);
+          if (out.length>=limit) break;
         }
       }
-      out.sort((a,b)=>String(a.label).localeCompare(String(b.label),undefined,{sensitivity:'base'}));
-      return out.slice(0,limit);
+      return out;
     }
   }
 
@@ -1499,6 +1524,9 @@
       this._lineSubtreeLower=new Map();
       this._lineToRecordGuid=new Map();
       this._recordLineGuids=new Map();
+      // Memoized sorted unique tag list for tag autocomplete; invalidated on any write path that may
+      // change `_entries[*].tags`. Cleared to null — a miss rebuilds on next `getAllTagsSorted()`.
+      this._sortedTagsCache=null;
     }
 
     setPeople(peopleIndex) { this._people=peopleIndex; }
@@ -1534,14 +1562,15 @@
       this._lineSubtreeLower=new Map();
       this._lineToRecordGuid=new Map();
       this._recordLineGuids=new Map();
+      this._sortedTagsCache=null;
     }
 
     upsert(record,collectionGuid) {
       const colName=this._colNames.get(collectionGuid)||'';
       this._entries.set(record.guid,this._makeEntry(record,collectionGuid,colName));
+      this._sortedTagsCache=null;
     }
 
-    registerCollection(guid,name) { this._colNames.set(guid,name); }
     remove(guid) {
       this._entries.delete(guid);
       const lg=this._recordLineGuids.get(guid);
@@ -1554,6 +1583,7 @@
       }
       // Clean up mention index
       for (const [,set] of this._mentionIndex) set.delete(guid);
+      this._sortedTagsCache=null;
     }
 
     /** Rebuild line → subtree text maps for one record (call after getLineItems). */
@@ -1578,13 +1608,14 @@
     size()            { return this._entries.size; }
     collectionCount() { return this._colNames.size; }
 
-    /** Unique normalized tags across all indexed entries, sorted. */
+    /** Unique normalized tags across all indexed entries, sorted. Cached; invalidated on build/upsert/remove. */
     getAllTagsSorted() {
+      if (this._sortedTagsCache) return this._sortedTagsCache;
       const s=new Set();
       for (const e of this._entries.values()) {
         for (const t of e.tags||[]) s.add(t);
       }
-      return [...s].sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'}));
+      return (this._sortedTagsCache=[...s].sort((a,b)=>a.localeCompare(b,undefined,{sensitivity:'base'})));
     }
 
     _makeEntry(record,collectionGuid,collectionName) {
@@ -1962,11 +1993,12 @@
       }
       const roots=wsRootLineItems(entry.record,items);
       const rows=[];
-      const em=host._h()._index._entries, pe=host._h()._index._people;
+      const { entries: em, people: pe } = host._h().indexSnapshot();
+      const data=host._h().data;
       await wsForEachLineItemDeep(roots,(li,depth)=>{
         if (!li.guid) return;
-        const raw=wsTextFromLineItem(li,{recordEntryMap:em,data:host._h().data});
-        const label=wsPreviewLineLabel(li,raw,em,pe,host._h().data);
+        const raw=wsTextFromLineItem(li,{recordEntryMap:em,data});
+        const label=wsPreviewLineLabel(li,raw,em,pe,data);
         if (!label) return;
         const line=`${label} ${li.guid}`.toLowerCase();
         if (filt&&!line.includes(filt)) return;
@@ -2001,7 +2033,7 @@
       const filt=(sp.el.querySelector('.ws-scope-filter')?.value||'').toLowerCase().trim();
       if (sp.step==='collection') {
         const rows=[];
-        for (const [guid,name] of host._h()._index._colNames) {
+        for (const [guid,name] of host._h().indexSnapshot().colNames) {
           const n=`${name} ${guid}`.toLowerCase();
           if (filt&&!n.includes(filt)) continue;
           rows.push({ guid,name });
@@ -2011,7 +2043,7 @@
         for (const b of list.querySelectorAll('[data-colid]')) {
           b.addEventListener('click',()=>{
             sp.colGuid=b.getAttribute('data-colid');
-            sp.colName=host._h()._index._colNames.get(sp.colGuid)||'';
+            sp.colName=host._h().getColName(sp.colGuid);
             sp.step='colConfirm';
             sp.recordEntry=null;
             if (sp.el.querySelector('.ws-scope-filter')) sp.el.querySelector('.ws-scope-filter').value='';
@@ -2057,7 +2089,7 @@
       }
       if (sp.step==='record') {
         const rows=[];
-        for (const e of host._h()._index._entries.values()) {
+        for (const e of host._h().indexSnapshot().entries.values()) {
           if (e.collectionGuid!==sp.colGuid) continue;
           const n=`${e.displayName||e.name} ${e.collectionName||''} ${e.guid}`.toLowerCase();
           if (filt&&!n.includes(filt)) continue;
@@ -2082,7 +2114,7 @@
         });
         for (const b of list.querySelectorAll('[data-recid]')) {
           b.addEventListener('click',()=>{
-            const e=host._h()._index._entries.get(b.getAttribute('data-recid'));
+            const e=host._h().getEntry(b.getAttribute('data-recid'));
             if (!e) return;
             sp.recordEntry=e;
             sp.step='confirm';
@@ -2451,7 +2483,7 @@
     } else if (wantCompletion!==null) {
       previewContext={ type:'task', wantCompleted:wantCompletion };
     } else if (personFilter) {
-      const people=host._h()._index._people;
+      const people=host._h().indexSnapshot().people;
       const mentionGuids=new Set();
       for (const ref of personFilter.mentionRefs) {
         const guids=people.resolve(ref.wildcard?ref.token+'*':ref.token);
@@ -2495,18 +2527,18 @@
       if (!subtree.size) { previewEl.innerHTML='<div class="ws-preview-empty">Could not resolve heading subtree</div>'; return; }
       const roots=wsRootLineItems(entry.record,flat);
       let found=0;
-      const idx=host._h()._index;
+      const snap=host._h().indexSnapshot();
+      const data=host._h().data;
       await wsForEachLineItemDeep(roots,(li,depth)=>{
         if (!subtree.has(li.guid)) return;
         if (!li.guid) return;
         const raw=wsTextFromLineItem(li,txOpts);
         const tl=raw.toLowerCase();
         if (!wsLineMatchesUnderPreviewLine(tl,pq)) return;
-        const label=wsPreviewLineLabel(li,raw,idx._entries,idx._people,host._h().data);
+        const label=wsPreviewLineLabel(li,raw,snap.entries,snap.people,data);
         if (!label) return;
         found++;
-        const people=idx._people;
-        const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,people,pq,(e,ent,li2,ig)=>host._onPreviewLineInteraction(e,ent,li2,ig));
+        const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,snap.people,pq,(e,ent,li2,ig)=>host._onPreviewLineInteraction(e,ent,li2,ig));
         previewEl.appendChild(div);
       });
       if (!found) previewEl.innerHTML='<div class="ws-preview-empty">No matching lines in this subtree</div>';
@@ -2526,17 +2558,17 @@
         previewEl.appendChild(div);
       }
       const roots=wsRootLineItems(entry.record,items);
-      const idx2=host._h()._index;
+      const snap2=host._h().indexSnapshot();
+      const data2=host._h().data;
       await wsForEachLineItemDeep(roots,(li,depth)=>{
         if (!li.guid) return;
         const raw=wsTextFromLineItem(li,txOpts);
         const tl=raw.toLowerCase();
         if (!wsLineMatchesUnderPreviewLine(tl,pq)) return;
-        const label=wsPreviewLineLabel(li,raw,idx2._entries,idx2._people,host._h().data);
+        const label=wsPreviewLineLabel(li,raw,snap2.entries,snap2.people,data2);
         if (!label) return;
         found++;
-        const people=idx2._people;
-        const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,people,pq,(e,ent,li2,ig)=>host._onPreviewLineInteraction(e,ent,li2,ig));
+        const div=wsCreateScopePreviewLineDiv(entry,li,depth,label,snap2.people,pq,(e,ent,li2,ig)=>host._onPreviewLineInteraction(e,ent,li2,ig));
         previewEl.appendChild(div);
       });
       if (!found) previewEl.innerHTML='<div class="ws-preview-empty">No matching lines in this note</div>';
@@ -2547,11 +2579,12 @@
       const filtered=await wsFilterTaskLinesForPreview(entry.record,items,wantCompleted);
       previewEl.innerHTML='';
       if (!filtered.length) { previewEl.innerHTML='<div class="ws-preview-empty">No matching tasks</div>'; return; }
-      const idxT=host._h()._index;
+      const snapT=host._h().indexSnapshot();
+      const dataT=host._h().data;
       for (const {li,depth} of filtered) {
         if (!li.guid) continue;
         const raw=wsTextFromLineItem(li,txOpts);
-        const label=wsPreviewLineLabel(li,raw,idxT._entries,idxT._people,host._h().data);
+        const label=wsPreviewLineLabel(li,raw,snapT.entries,snapT.people,dataT);
         if (!label) continue;
         const div=document.createElement('div'); div.className='ws-preview-line';
         div.style.paddingLeft=(10+Math.min(depth,12)*14)+'px';
@@ -2567,7 +2600,9 @@
       if (tk!==host._previewLoadToken) return;
       previewEl.innerHTML='';
       let found=0;
-      const people=host._h()._index._people;
+      const snapM=host._h().indexSnapshot();
+      const people=snapM.people;
+      const dataM=host._h().data;
       const roots=wsRootLineItems(entry.record, items);
       await wsForEachLineItemDeep(roots, (li, depth) => {
         const matchedGuids=new Set();
@@ -2578,7 +2613,7 @@
         if (!matchedGuids.size) return;
         if (!li.guid) return;
         const raw=wsTextFromLineItem(li,txOpts);
-        const label=wsPreviewLineLabel(li,raw,host._h()._index._entries,host._h()._index._people,host._h().data);
+        const label=wsPreviewLineLabel(li,raw,snapM.entries,snapM.people,dataM);
         if (!label) return;
         found++;
         const div=document.createElement('div'); div.className='ws-preview-line';
@@ -2631,14 +2666,15 @@
   const SearchPanelScopeRow={
     inferCollectionGuid(host,scope) {
       if (!scope) return null;
+      const plugin=host._h();
       if (scope.inRecordGuid) {
-        const e=host._h()._index._entries.get(scope.inRecordGuid);
+        const e=plugin.getEntry(scope.inRecordGuid);
         return e&&e.collectionGuid?e.collectionGuid:null;
       }
       if (scope.underLineGuid) {
-        const rg=host._h()._index._lineToRecordGuid.get(scope.underLineGuid);
+        const rg=plugin.indexSnapshot().lineToRecordGuid.get(scope.underLineGuid);
         if (!rg) return null;
-        const e=host._h()._index._entries.get(rg);
+        const e=plugin.getEntry(rg);
         return e&&e.collectionGuid?e.collectionGuid:null;
       }
       return null;
@@ -2651,27 +2687,28 @@
       const { scope }=wsExtractScope(wsResolveScopeAliases(q,host._scopeAliasResolved));
       if (!wsScopeHas(scope)) { row.classList.add('ws-hidden'); row.innerHTML=''; return; }
       row.classList.remove('ws-hidden');
+      const plugin=host._h();
       const parts=[];
       if (scope.inCollectionGuid) {
-        const name=host._h()._index._colNames.get(scope.inCollectionGuid)||scope.inCollectionGuid.slice(0,8)+'…';
-        const fullName=host._h()._index._colNames.get(scope.inCollectionGuid)||scope.inCollectionGuid;
-        parts.push(`<span class="ws-scope-chip" title="${wsEsc(fullName)}"><span>Collection: ${wsEsc(name)}</span><button type="button" class="ws-scope-x" data-scope="col" title="Remove">${wsIcon('x')}</button></span>`);
+        const full=plugin.getColName(scope.inCollectionGuid)||scope.inCollectionGuid;
+        const name=plugin.getColName(scope.inCollectionGuid)||scope.inCollectionGuid.slice(0,8)+'…';
+        parts.push(`<span class="ws-scope-chip" title="${wsEsc(full)}"><span>Collection: ${wsEsc(name)}</span><button type="button" class="ws-scope-x" data-scope="col" title="Remove">${wsIcon('x')}</button></span>`);
       } else {
         const inferredCol=SearchPanelScopeRow.inferCollectionGuid(host,scope);
         if (inferredCol) {
-          const name=host._h()._index._colNames.get(inferredCol)||inferredCol.slice(0,8)+'…';
-          const fullName=host._h()._index._colNames.get(inferredCol)||inferredCol;
-          parts.push(`<span class="ws-scope-chip ws-scope-chip-implicit" title="Collection that contains this note (not in query) · ${wsEsc(fullName)}"><span>Collection: ${wsEsc(name)}</span></span>`);
+          const full=plugin.getColName(inferredCol)||inferredCol;
+          const name=plugin.getColName(inferredCol)||inferredCol.slice(0,8)+'…';
+          parts.push(`<span class="ws-scope-chip ws-scope-chip-implicit" title="Collection that contains this note (not in query) · ${wsEsc(full)}"><span>Collection: ${wsEsc(name)}</span></span>`);
         }
       }
       if (scope.inRecordGuid) {
-        const e=host._h()._index._entries.get(scope.inRecordGuid);
+        const e=plugin.getEntry(scope.inRecordGuid);
         const name=e?e.displayName:(scope.inRecordGuid.slice(0,8)+'…');
         const fullNote=e?(e.displayName||e.name||''):scope.inRecordGuid;
         parts.push(`<span class="ws-scope-chip" title="${wsEsc(fullNote)}"><span>Note: ${wsEsc(name)}</span><button type="button" class="ws-scope-x" data-scope="rec" title="Remove">${wsIcon('x')}</button></span>`);
       }
       if (scope.underLineGuid) {
-        const sub=host._h()._index._lineSubtreeLower.get(scope.underLineGuid);
+        const sub=plugin.indexSnapshot().lineSubtreeLower.get(scope.underLineGuid);
         const preview=sub?sub.slice(0,120).replace(/\s+/g,' ').trim():'…';
         const tip=sub?sub.slice(0,800).replace(/\s+/g,' ').trim():'';
         parts.push(`<span class="ws-scope-chip"${tip?` title="${wsEsc(tip)}"`:''}><span>Under: ${wsEsc(preview)}</span><button type="button" class="ws-scope-x" data-scope="under" title="Remove">${wsIcon('x')}</button></span>`);
@@ -2756,8 +2793,9 @@
           items.push({ kind:'tag', kindLabel:'Tag', label:'#'+t, replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:'#'+t });
         }
       } else if (ctx.type==='person') {
-        if (!host._h()._index._people.isConfigured()) { host._closeAc(); return; }
-        for (const s of host._h()._index._people.suggestByPrefix(ctx.prefix,30)) {
+        const people=host._h().indexSnapshot().people;
+        if (!people.isConfigured()) { host._closeAc(); return; }
+        for (const s of people.suggestByPrefix(ctx.prefix,30)) {
           items.push({ kind:'person', kindLabel:'@', label:s.label, replaceStart:ctx.replaceStart, replaceEnd:ctx.replaceEnd, replaceWith:s.insert });
         }
       }
@@ -2847,7 +2885,7 @@
           const nameLower=entry.record.getName().toLowerCase();
           const bodyTerms=allTerms.filter(t=>!nameLower.includes(t));
           const searchTerms=bodyTerms.length?bodyTerms:allTerms;
-          const em=host._h()._index._entries;
+          const em=host._h().indexSnapshot().entries;
           const match=lineItems.find(li=>{ try { const text=wsTextFromLineItem(li,{recordEntryMap:em}).toLowerCase(); return searchTerms.every(t=>text.includes(t)); } catch(e) { return false; } });
           if (!match) return;
           await new Promise(r=>setTimeout(r,350));
@@ -2955,7 +2993,7 @@
       this._plugin=plugin; this._panel=panel; this._parser=parser;
       this._nameResults=[]; this._bodyResults=[]; this._allResults=[];
       this._selectedIdx=-1; this._openedGuid=null;
-      this._query=''; this._debounce=null; this._searchToken=0;
+      this._query=''; this._debounce=null; this._acDebounce=null; this._searchToken=0;
       this._expandedGuid=null; this._previewLoadToken=0;
       this._scopeAliasResolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null };
       this._previewCtxMenuEl=null; this._previewCtxMenuCleanup=null;
@@ -3129,12 +3167,6 @@
       this._sizePinRemeasure=null;
     }
 
-    refreshStatus() {
-      this._updateStatus();
-      if (!this._query&&!this._configMode) this._renderEmptyState();
-      else if (!this._configMode) this._syncPeopleDisabledWarning();
-    }
-
     _buildHeader() {
       const header=document.createElement('div'); header.className='ws-header';
       header.innerHTML=`
@@ -3166,12 +3198,21 @@
         clearBtn.classList.toggle('ws-hidden',!q.length);
         saveBtn.disabled=!q.trim();
         this._renderScopeChips();
-        SearchPanelAutocomplete.refreshFromInput(this);
+        // AC refresh is independently debounced (~50ms) so fast typing doesn't re-run the
+        // autocomplete context detection and list rebuild on every keystroke. The main search
+        // keeps its own 150ms debounce below.
+        clearTimeout(this._acDebounce);
+        this._acDebounce=setTimeout(()=>SearchPanelAutocomplete.refreshFromInput(this),50);
         clearTimeout(this._debounce);
         this._debounce=setTimeout(()=>this._search(q),150);
       });
       input.addEventListener('keydown',(e)=>SearchPanelNavigate.handleKey(this,e));
-      input.addEventListener('click',()=>SearchPanelAutocomplete.refreshFromInput(this));
+      input.addEventListener('click',()=>{
+        // Click is user-paced (not per-keystroke), so run the AC refresh immediately but
+        // cancel any pending debounced refresh so we don't double-render.
+        clearTimeout(this._acDebounce); this._acDebounce=null;
+        SearchPanelAutocomplete.refreshFromInput(this);
+      });
       clearBtn.addEventListener('click',()=>{ this._closeAc(); input.value=''; clearBtn.classList.add('ws-hidden'); saveBtn.disabled=true; this._scopeAliasResolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null }; this._renderScopeChips(); this._search(''); input.focus(); });
       saveBtn.addEventListener('click',()=>this._openSaveForm());
       header.querySelector('.ws-scope-open-btn')?.addEventListener('click',()=>this._openScopePicker());
@@ -3216,18 +3257,10 @@
 
     _closeAc() {
       this._acOpen=false; this._acItems=[]; this._acSel=0;
+      if (this._acDebounce) { clearTimeout(this._acDebounce); this._acDebounce=null; }
       if (this._acEl) { this._acEl.classList.remove('ws-ac-visible'); this._acEl.innerHTML=''; }
     }
 
-    _renderAcList() { SearchPanelAutocomplete.renderAcList(this); }
-    _applyAcSelection() { SearchPanelAutocomplete.applySelection(this); }
-    _refreshAcFromInput() { SearchPanelAutocomplete.refreshFromInput(this); }
-    _openSavedSearchesAc() { SearchPanelAutocomplete.openSaved(this); }
-    _handleKey(e) { SearchPanelNavigate.handleKey(this,e); }
-    _moveSelection(dir) { SearchPanelNavigate.moveSelection(this,dir); }
-    _highlightSelected() { SearchPanelNavigate.highlightSelected(this); }
-    _scrollToSelected() { SearchPanelNavigate.scrollToSelected(this); }
-    _openSelected() { SearchPanelNavigate.openSelected(this); }
     async _navigateToRecord(entry) { return SearchPanelNavigate.navigateToRecord(this,entry); }
     async _navigateToRecordLine(entry,itemGuid) { return SearchPanelNavigate.navigateToRecordLine(this,entry,itemGuid); }
     async _navigateToPreviewLinkTarget(li) { return SearchPanelNavigate.navigateToPreviewLinkTarget(this,li); }
@@ -3292,7 +3325,7 @@
       this._closePreviewLineMenu();
       const tk=++this._previewLoadToken;
       previewEl.innerHTML=`<div class="ws-preview-loading">Loading…</div>`;
-      const txOpts={recordEntryMap:this._h()._index._entries,data:this._h().data};
+      const txOpts={recordEntryMap:this._h().indexSnapshot().entries,data:this._h().data};
       try {
         await wsSearchPanelLoadPreviewBody(this, entry, previewContext, previewEl, tk, txOpts);
       } catch(e) {
@@ -3311,7 +3344,7 @@
       if (!el) return;
       if (this._configMode) { el.classList.add('ws-hidden'); el.textContent=''; return; }
       const parsed=this._parser.parse(this._queryResolvedForParse()||'');
-      const needPeopleSyntax=!!parsed && !this._h()._index._people.isConfigured() && wsPersonPreviewFilter(parsed);
+      const needPeopleSyntax=!!parsed && !this._h().indexSnapshot().people.isConfigured() && wsPersonPreviewFilter(parsed);
       if (needPeopleSyntax) {
         el.classList.remove('ws-hidden');
         el.textContent='People search (@name, field:@name, mentions:@name) needs a People collection. Open settings (gear icon) and choose a People collection.';
@@ -3361,7 +3394,7 @@
       const processRecord=(record)=>{
         if (!record||seen.has(record.guid)) return;
         seen.add(record.guid);
-        const indexed=this._h()._index._entries.get(record.guid);
+        const indexed=this._h().getEntry(record.guid);
         if (indexed&&this._h()._index.matchesParsedEntryFilters(indexed,parsed)) bodyEntries.push({...indexed,_bodyMatch:true});
       };
       for (const r of (result.records||[])) processRecord(r);
@@ -3393,11 +3426,7 @@
     _updateStatus() {
       const bar=this._root?.querySelector('.ws-status');
       if (!bar) return;
-      const rCount=this._h()._index.size(),cCount=this._h()._index.collectionCount();
-      const pCount=this._h()._index._people.size();
-      const pStr=pCount>0?` · ${pCount} people`:'';
-      if (rCount>0) { bar.innerHTML=`<span class="ws-status-dot"></span>${cCount} collection${cCount!==1?'s':''} · ${rCount.toLocaleString()} records${pStr}`; }
-      else { bar.innerHTML=`<span class="ws-status-dot ws-building"></span>Building index…`; }
+      bar.innerHTML=wsFormatIndexStatusBarHtml(this._h()._index);
     }
 
     _updateFooter(resultCount) {
@@ -3414,14 +3443,11 @@
 
     _openSaveForm() { SearchPanelSaved.openForm(this); }
 
-    _cancelSaveForm(formEl) { SearchPanelSaved.cancelForm(this, formEl); }
-
     async _openConfig() { return SearchPanelConfig.open(this); }
 
     _closeConfig() { SearchPanelConfig.close(this); }
 
     _renderScopeChips() { SearchPanelScopeRow.renderChips(this); }
-    _removeScopePart(part) { SearchPanelScopeRow.removePart(this,part); }
 
     _applyScopeSelection(scope) {
       const input=this._root?.querySelector('.ws-input');
@@ -3438,13 +3464,8 @@
       input.focus();
     }
 
-    _rerenderScopePickerAndFocus() { return SearchPanelScope.rerenderAndFocus(this); }
     _openScopePicker() { SearchPanelScope.open(this); }
     _closeScopePicker() { SearchPanelScope.close(this); }
-    _scopePickerFocusDefault() { SearchPanelScope.focusDefault(this); }
-    _scopePickerSetChrome(sp) { SearchPanelScope.setChrome(sp); }
-    async _renderScopePickerList() { return SearchPanelScope.renderList(this); }
-    async _renderScopePickerLines() { return SearchPanelScope.renderLines(this); }
   }
 
   /** Load all collections + records needed for people + main index (null on failure). */
@@ -3719,6 +3740,35 @@
 
     async _saveSavedSearches(list) { await this._savePersisted({ savedSearches:list }); }
 
+    // ─── Stable read API for UI modules ──────────────────────────────────────
+    // UI modules (SearchPanel + its satellites) should read index state through these
+    // accessors instead of touching `_index._entries`, `_index._colNames`, etc. directly.
+    // That keeps the index internals free to evolve (e.g. replacing a Map with a sharded
+    // store) without requiring changes across 30+ callsites in the UI layer.
+
+    /** Indexed record entry by GUID, or `undefined` if not currently indexed. */
+    getEntry(guid) { return this._index._entries.get(guid); }
+
+    /** Collection display name for a collection GUID, or `''` if unknown. */
+    getColName(guid) { return this._index._colNames.get(guid) || ''; }
+
+    /**
+     * Live refs to the internal index maps. Callers **must** treat this as read-only —
+     * the Plugin owns all mutation. Returned in one call so UI functions that combine
+     * multiple lookups (preview loaders, scope chip resolution, people autocomplete) can
+     * grab everything they need once instead of chaining `host._h()._index.*` repeatedly.
+     */
+    indexSnapshot() {
+      const idx=this._index;
+      return {
+        entries: idx._entries,
+        colNames: idx._colNames,
+        people: idx._people,
+        lineToRecordGuid: idx._lineToRecordGuid,
+        lineSubtreeLower: idx._lineSubtreeLower,
+      };
+    }
+
     /**
      * Serialized index build.
      *
@@ -3862,10 +3912,6 @@
     _notifyPanelRebuild(panel) {
       const statusBar=panel.getElement()?.querySelector('.ws-status');
       if (!statusBar) return;
-      const rCount=this._index.size(),cCount=this._index.collectionCount(),pCount=this._index._people.size();
-      const pStr=pCount>0?` · ${pCount} people`:'';
-      statusBar.innerHTML=rCount>0
-        ?`<span class="ws-status-dot"></span>${cCount} collection${cCount!==1?'s':''} · ${rCount.toLocaleString()} records${pStr}`
-        :`<span class="ws-status-dot ws-building"></span>Building index…`;
+      statusBar.innerHTML=wsFormatIndexStatusBarHtml(this._index);
     }
   }
