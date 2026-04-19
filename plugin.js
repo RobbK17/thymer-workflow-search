@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.5.1
+   * Version 1.1.6
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -31,11 +31,11 @@
    *   Enter           → open selected record / accept suggestion
    *   Esc             → close autocomplete
    *   ⌃Space          → saved-search picker
-   *   ⌘⇧S / Ctrl+Shift+S → open/focus search panel
+   *   ⌘⇧S / Ctrl+Shift+S → toggle search panel (open/focus, or close if already active)
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.5.1';
+  const WS_VERSION = '1.1.6';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
@@ -320,8 +320,9 @@
       position: relative;
       display: flex;
       flex-direction: column;
-      flex: 1;
+      flex: 1 1 auto;
       min-height: 0;
+      height: 100%;
       width: 100%;
       overflow: hidden;
       background: var(--ws-panel);
@@ -521,9 +522,12 @@
     .ws-btn-primary:hover { background: rgba(var(--ws-accent-rgb),1); }
     .ws-btn-secondary { background: rgba(var(--ws-on-dark-rgb),0.07); color: var(--ws-fg); border: 1px solid rgba(var(--ws-on-dark-rgb),0.10); }
     .ws-btn-secondary:hover { background: rgba(var(--ws-on-dark-rgb),0.12); }
-    .ws-footer { padding: 6px 12px; border-top: 1px solid rgba(var(--ws-on-dark-rgb),0.07); flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; }
+    .ws-footer { padding: 5px 12px 6px; border-top: 1px solid rgba(var(--ws-on-dark-rgb),0.07); flex-shrink: 0; display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; }
     .ws-result-count { font-size: 10px; color: var(--ws-muted); }
-    .ws-hint { font-size: 9px; color: rgba(var(--ws-muted-rgb),0.55); letter-spacing: 0.03em; }
+    .ws-result-count:empty { display: none; }
+    .ws-hint { font-size: 9px; color: rgba(var(--ws-muted-rgb),0.55); letter-spacing: 0.03em; text-align: center; line-height: 1.65; max-width: 100%; }
+    .ws-hint-group { white-space: nowrap; }
+    .ws-hint-sep { white-space: nowrap; opacity: 0.55; margin: 0 2px; }
     .ws-save-form { display: flex; align-items: center; gap: 6px; padding: 7px 12px; border-bottom: 1px solid rgba(var(--ws-on-dark-rgb),0.07); background: rgba(var(--ws-accent-rgb),0.06); flex-shrink: 0; }
     .ws-save-form-label { font-size: 10px; color: var(--ws-muted); white-space: nowrap; flex-shrink: 0; }
     .ws-save-input { flex: 1; min-width: 0; padding: 3px 7px; background: rgba(var(--ws-on-dark-rgb),0.07); border: 1px solid rgba(var(--ws-accent-rgb),0.4); border-radius: 4px; color: var(--ws-fg); font-size: 11px; outline: none; font-family: inherit; }
@@ -2974,6 +2978,9 @@
       this._root?.setAttribute('data-ws-theme',applied);
       this._root?.setAttribute('data-ws-theme-choice',choice);
       if (choice==='system') this._installThemeWatchers(); else this._disposeThemeWatchers();
+      // Theme flips can cause the host to rewrite panel chrome (different tab bar height, inline
+      // style reset, etc.). Re-pin the panel height so sizing stays identical across dark/light.
+      try { this._sizePinRemeasure?.(); requestAnimationFrame(()=>this._sizePinRemeasure?.()); } catch(e) {}
     }
 
     /** Re-apply theme whenever the host/OS changes color scheme. Only active when the user chose "Match System". */
@@ -3010,11 +3017,27 @@
       if (this._root.getAttribute('data-ws-theme-choice')!=='system') return;
       const resolved=wsResolveSystemTheme();
       if (this._root.getAttribute('data-ws-theme')!==resolved) this._root.setAttribute('data-ws-theme',resolved);
+      // Host theme flipped under us: re-measure in case chrome around the panel changed height.
+      try { this._sizePinRemeasure?.(); requestAnimationFrame(()=>this._sizePinRemeasure?.()); } catch(e) {}
     }
 
     mount() {
       const el=this._panel.getElement();
       if (!el) return;
+      // Force the host-provided panel element into a fixed-height flex column. `height: 100%` alone is
+      // not enough because the parent chain in the Thymer panel layout may not propagate a concrete
+      // height — so we ALSO pin `el.style.height` to an explicit pixel value equal to
+      // `window.innerHeight - el.getBoundingClientRect().top` (see `_pinPanelHeight` below). This keeps
+      // the panel at the full available height regardless of host layout, and prevents the dialog from
+      // visibly resizing as `.ws-body` swaps between empty-state / results / settings.
+      Object.assign(el.style, {
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: '0',
+        overflow: 'hidden',
+        position: el.style.position || 'relative',
+      });
+      this._installPanelSizePin(el);
       const root=document.createElement('div');
       root.className='ws-root'; this._root=root;
       root.appendChild(this._buildHeader());
@@ -3043,6 +3066,67 @@
         });
       };
       _inject();
+    }
+
+    /**
+     * Pin `el.style.height` to exactly the available vertical space so the panel is always full-height
+     * and does not resize when `.ws-body` content changes. The available height is measured as
+     * `window.innerHeight - el.getBoundingClientRect().top`, which automatically adjusts for any host
+     * chrome above the panel (tabs, toolbars, app title bar) without us needing to know its structure.
+     *
+     * Re-measures on: window resize, `el.parentElement` + `document.body` size changes, page
+     * visibility flips, and — defensively — whenever `el.style` mutates (some host themes rewrite
+     * inline styles on theme flip, which would clobber our height). Also exposes `remeasure()` so
+     * callers (e.g. `_applyUiTheme`) can force a fresh measurement after a theme change.
+     */
+    _installPanelSizePin(el) {
+      this._disposeSizeWatcher();
+      let pinning=false;
+      const measure=()=>{
+        if (!el.isConnected) return;
+        const top=el.getBoundingClientRect().top;
+        const avail=Math.max(0, Math.floor((window.innerHeight||document.documentElement.clientHeight||0) - top));
+        if (avail<=0) return;
+        const want=avail+'px';
+        if (el.style.height!==want) {
+          pinning=true;
+          try { el.style.height=want; } finally { pinning=false; }
+        }
+      };
+      this._sizePinRemeasure=measure;
+      // First pass after the current layout tick, plus two more frames later in case host chrome is
+      // still settling (tab bar animating in on first open, or host theme flipping).
+      requestAnimationFrame(()=>{ measure(); requestAnimationFrame(()=>{ measure(); requestAnimationFrame(measure); }); });
+      const onWinResize=()=>measure();
+      window.addEventListener('resize', onWinResize, { passive: true });
+      let ro=null;
+      try {
+        ro=new ResizeObserver(()=>measure());
+        if (el.parentElement) ro.observe(el.parentElement);
+        ro.observe(document.body);
+      } catch(e) {}
+      const onVis=()=>measure();
+      document.addEventListener('visibilitychange', onVis);
+      // Defensive: if the host rewrites `el.style` on a theme flip (wiping our pinned height),
+      // re-measure immediately. Guarded by `pinning` so our own writes don't recurse.
+      let styleMo=null;
+      try {
+        styleMo=new MutationObserver(()=>{ if (!pinning) measure(); });
+        styleMo.observe(el,{ attributes:true, attributeFilter:['style','class'] });
+      } catch(e) {}
+      this._sizePinCleanup=()=>{
+        try { window.removeEventListener('resize', onWinResize); } catch(e) {}
+        try { document.removeEventListener('visibilitychange', onVis); } catch(e) {}
+        try { ro?.disconnect(); } catch(e) {}
+        try { styleMo?.disconnect(); } catch(e) {}
+        this._sizePinRemeasure=null;
+      };
+    }
+
+    _disposeSizeWatcher() {
+      try { this._sizePinCleanup?.(); } catch(e) {}
+      this._sizePinCleanup=null;
+      this._sizePinRemeasure=null;
     }
 
     refreshStatus() {
@@ -3098,7 +3182,20 @@
     _buildFooter() {
       const footer=document.createElement('div'); footer.className='ws-footer';
       const modHint=wsModClickLinkHint();
-      footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">↑↓ results &nbsp;·&nbsp; ⏎ open &nbsp;·&nbsp; ⌘S save &nbsp;·&nbsp; ⌃Space saved &nbsp;·&nbsp; ${modHint} &nbsp;·&nbsp; suggestions: ↑↓ ⏎ Esc</span>`;
+      // Each shortcut group uses `&nbsp;` between keys so it never wraps mid-group (e.g. `Esc`
+      // breaking off `↑↓ ⏎`). Separators are their own spans so breaks can happen only between
+      // groups. The footer is `flex-wrap: wrap` so the hint flows cleanly to a second line on
+      // narrow panel widths. Non-breaking inside groups: thin-space-free, using `\u00A0`.
+      const groups=[
+        '↑↓\u00A0results',
+        '⏎\u00A0open',
+        '⌘S\u00A0save',
+        '⌃Space\u00A0saved',
+        modHint.replace(/\s/g,'\u00A0'),
+        'suggestions:\u00A0↑↓\u00A0⏎\u00A0Esc',
+      ];
+      const hint=groups.map(g=>`<span class="ws-hint-group">${g}</span>`).join('<span class="ws-hint-sep">·</span>');
+      footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">${hint}</span>`;
       return footer;
     }
 
@@ -3414,7 +3511,7 @@
       this._cmd=this.ui.addCommandPaletteCommand({label:'WorkflowSearch: Open search panel',icon:'search',onSelected:()=>this._openPanel()});
       this._sidebarItem=this.ui.addSidebarItem({label:'Search',icon:'search',tooltip:'Search collections (⌘⇧S)',onClick:()=>this._openPanel()});
 
-      this._keyHandler=(e)=>{ const k=(e.key||'').toLowerCase(); if ((e.metaKey||e.ctrlKey)&&e.shiftKey&&k==='s') { e.preventDefault(); this._openPanel(); } };
+      this._keyHandler=(e)=>{ const k=(e.key||'').toLowerCase(); if ((e.metaKey||e.ctrlKey)&&e.shiftKey&&k==='s') { e.preventDefault(); this._togglePanel(); } };
       document.addEventListener('keydown',this._keyHandler,true);
 
       await this._maybeMigrateLocalStorageToPlugin();
@@ -3455,6 +3552,7 @@
       if (this._keyHandler) document.removeEventListener('keydown',this._keyHandler,true);
       if (this._buildRetryTimer) { clearTimeout(this._buildRetryTimer); this._buildRetryTimer=null; }
       try { this._searchPanel?._disposeThemeWatchers(); } catch(e) {}
+      try { this._searchPanel?._disposeSizeWatcher(); } catch(e) {}
       if (_wsActiveHost===this) _wsActiveHost=null;
     }
 
@@ -3467,6 +3565,48 @@
       }
       const newPanel=await this.ui.createPanel();
       if (newPanel) newPanel.navigateToCustomType(WS_PANEL_TYPE);
+    }
+
+    /**
+     * Toggle the search panel for `⌘⇧S` / `Ctrl+Shift+S`:
+     *   • no panel open → create & open
+     *   • panel open but user is NOT inside it → activate and focus the input
+     *   • panel open AND user is inside it (focus is on any element inside our panel) → close it
+     *
+     * We determine "the user is using our panel" primarily by checking whether `document.activeElement`
+     * is inside our panel's DOM. Thymer's `ui.getActivePanel()` is a weaker signal — it tracks the
+     * host's own activation (updated on click/title-bar activation) and does NOT necessarily flip when
+     * focus simply lands on an input inside the panel, so relying on it alone means a second press
+     * with focus in the search field would fail the "is active" check and just re-focus. We fall back
+     * to `getActivePanel()` when the DOM focus check is inconclusive (e.g. focus on <body>).
+     */
+    async _togglePanel() {
+      if (this._searchPanelId) {
+        const panels=this.ui.getPanels()||[];
+        const existing=panels.find(p=>p.getId()===this._searchPanelId);
+        if (existing) {
+          const el=existing.getElement?.();
+          const ae=typeof document!=='undefined'?document.activeElement:null;
+          const focusInside=!!(el&&ae&&(ae===el||el.contains(ae)));
+          let hostActive=false;
+          if (!focusInside) {
+            try {
+              const active=(typeof this.ui.getActivePanel==='function')?this.ui.getActivePanel():null;
+              hostActive=!!(active&&active.getId?.()===existing.getId?.());
+            } catch(e) {}
+          }
+          if (focusInside||hostActive) {
+            try { this.ui.closePanel(existing); } catch(e) { await this._openPanel(); return; }
+            this._searchPanelId=null;
+            return;
+          }
+          this.ui.setActivePanel(existing);
+          el?.querySelector('.ws-input')?.focus();
+          return;
+        }
+        this._searchPanelId=null;
+      }
+      await this._openPanel();
     }
 
     _getRawPluginWorkflowSearch() {
