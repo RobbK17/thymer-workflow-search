@@ -1,6 +1,6 @@
   /**
    * WorkflowSearch — AppPlugin
-   * Version 1.1.7
+   * Version 1.1.8
    *
    * Persistent panel-based Workflowy-style search across Thymer collections.
    *
@@ -30,14 +30,14 @@
    *
    * Keyboard:
    *   ↑ ↓             → navigate results (or suggestions when autocomplete is open)
-   *   Enter           → open selected record / accept suggestion
-   *   Esc             → close autocomplete
+   *   Enter           → open selected record / accept suggestion / (batch delete) toggle row checkbox
+   *   Esc             → close autocomplete / (batch delete) cancel selection and exit batch mode
    *   ⌃Space          → saved-search picker
    *   ⌘⇧S / Ctrl+Shift+S → toggle search panel (open/focus, or close if already active)
    *   ⌘S / Ctrl+S     → save current search
    */
 
-  const WS_VERSION = '1.1.7';
+  const WS_VERSION = '1.1.8';
 
   /** Legacy keys (used if `saveConfiguration` is unavailable). */
   const WS_LS_CONFIG = 'ws_search_config';
@@ -542,6 +542,10 @@
     .ws-body::-webkit-scrollbar-track { background: transparent; }
     .ws-body::-webkit-scrollbar-thumb { background: rgba(var(--ws-on-dark-rgb),0.12); border-radius: 2px; }
     .ws-body::-webkit-scrollbar-thumb:hover { background: rgba(var(--ws-on-dark-rgb),0.2); }
+    .ws-result-checkbox { accent-color: var(--ws-accent-solid); cursor: pointer; margin: 0 6px 0 8px; flex-shrink: 0; width: 14px; height: 14px; align-self: center; }
+    .ws-batch-delete-bar { display: flex; align-items: center; padding: 8px 12px; background: rgba(244, 67, 54, 0.08); border-top: 1px solid rgba(244, 67, 54, 0.2); color: var(--ws-fg); font-size: 12px; gap: 12px; }
+    .ws-delete-count { font-weight: 500; color: var(--ws-fg); }
+    .ws-batch-btn.ws-active { color: var(--ws-accent-t); background: rgba(var(--ws-accent-rgb), 0.18); }
   `;
 
   // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -2972,6 +2976,26 @@
         if (e.key==='Escape')     { e.preventDefault(); host._closeAc(); return; }
         if (e.key==='Tab')       { host._closeAc(); return; }
       }
+      if (host._batchMode) {
+        if (e.key==='Escape') {
+          e.preventDefault();
+          host._selectedForDelete.clear();
+          host._batchMode=false;
+          host._root?.querySelector('.ws-batch-btn')?.classList.remove('ws-active');
+          host._renderResults();
+          host._updateBatchModeUI();
+          return;
+        }
+        if (e.key==='Enter') {
+          e.preventDefault();
+          const entry=host._allResults[host._selectedIdx];
+          if (!entry) return;
+          const wrap=host._root?.querySelector(`.ws-result-wrap[data-idx="${host._selectedIdx}"]`);
+          const cb=wrap?.querySelector('.ws-result-checkbox');
+          if (cb) { cb.checked=!cb.checked; cb.dispatchEvent(new Event('change',{bubbles:true})); }
+          return;
+        }
+      }
       if (e.key==='ArrowDown')  { e.preventDefault(); SearchPanelNavigate.moveSelection(host,1); }
       else if (e.key==='ArrowUp')  { e.preventDefault(); SearchPanelNavigate.moveSelection(host,-1); }
       else if (e.key==='Enter')    { e.preventDefault(); SearchPanelNavigate.openSelected(host); }
@@ -3069,6 +3093,20 @@
 
         const rowRow=document.createElement('div'); rowRow.className='ws-result-row';
 
+        if (host._batchMode) {
+          const checkbox=document.createElement('input');
+          checkbox.type='checkbox';
+          checkbox.className='ws-result-checkbox';
+          checkbox.checked=host._selectedForDelete.has(entry.guid);
+          checkbox.addEventListener('change',(e)=>{
+            e.stopPropagation();
+            if (checkbox.checked) host._selectedForDelete.add(entry.guid);
+            else host._selectedForDelete.delete(entry.guid);
+            host._updateBatchModeUI();
+          });
+          rowRow.appendChild(checkbox);
+        }
+
         const expandBtn=document.createElement('button'); expandBtn.type='button';
         expandBtn.className='ws-result-expand'+(showExpand?'':' ws-hidden');
         expandBtn.title=expandTitle; expandBtn.innerHTML=wsIcon('chevron-right');
@@ -3084,9 +3122,16 @@
         const personBadge=entry._personMatch?`<span class="ws-person-badge">@</span>`:'';
 
         row.innerHTML=`<div class="ws-result-main">${iconHtml}<span class="ws-result-name">${wsEsc(entry.displayName)}${bodyBadge}${personBadge}</span><span class="ws-result-col">${wsEsc(entry.collectionName)}</span></div>${tagHtml}`;
-        row.addEventListener('click',()=>{ host._selectedIdx=idx; SearchPanelNavigate.highlightSelected(host); void SearchPanelNavigate.navigateToRecord(host,entry); });
-        row.addEventListener('mouseenter',()=>{ host._selectedIdx=idx; SearchPanelNavigate.highlightSelected(host); });
-
+        
+        row.addEventListener('mouseenter',()=>{ if (!host._batchMode) { host._selectedIdx=idx; SearchPanelNavigate.highlightSelected(host); } });
+        row.addEventListener('click',()=>{
+          if (host._batchMode) {
+            const cb=rowRow.querySelector('.ws-result-checkbox');
+            if (cb) { cb.checked=!cb.checked; cb.dispatchEvent(new Event('change')); }
+            return;
+          }
+          host._selectedIdx=idx; SearchPanelNavigate.highlightSelected(host); void SearchPanelNavigate.navigateToRecord(host,entry);
+        });
         rowRow.appendChild(expandBtn); rowRow.appendChild(row);
 
         const preview=document.createElement('div'); preview.className='ws-preview';
@@ -3124,6 +3169,8 @@
       this._scopeRowEl=null;
       this._scopeFilterDebounceTimer=null;
       this._themeWatchers=null;
+      this._batchMode=false;
+      this._selectedForDelete=new Set();
     }
 
     _h() { return _wsActiveHost || this._plugin; }
@@ -3296,6 +3343,7 @@
             <button type="button" class="ws-icon-btn ws-save-btn" title="Save search (⌘S)" disabled>${wsIcon('bookmark')}</button>
             <button class="ws-icon-btn ws-scope-open-btn" type="button" title="Search scope (in / under)">${wsIcon('filter')}</button>
             <button class="ws-icon-btn ws-config-btn" title="Configure">${wsIcon('settings')}</button>
+            <button type="button" class="ws-icon-btn ws-batch-btn" title="Bulk delete — select results, then Delete (moves to trash)">${wsIcon('trash')}</button>
           </div>
         </div>
         <div class="ws-header-search">
@@ -3336,6 +3384,7 @@
       });
       clearBtn.addEventListener('click',()=>{ this._closeAc(); input.value=''; clearBtn.classList.add('ws-hidden'); saveBtn.disabled=true; this._scopeAliasResolved={ underLineGuid:null,inRecordGuid:null,inCollectionGuid:null }; this._renderScopeChips(); this._search(''); input.focus(); });
       saveBtn.addEventListener('click',()=>this._openSaveForm());
+      header.querySelector('.ws-batch-btn')?.addEventListener('click',()=>this._toggleBatchMode());
       header.querySelector('.ws-scope-open-btn')?.addEventListener('click',()=>this._openScopePicker());
       configBtn.addEventListener('click',()=>this._configMode?this._closeConfig():this._openConfig());
       return header;
@@ -3344,10 +3393,6 @@
     _buildFooter() {
       const footer=document.createElement('div'); footer.className='ws-footer';
       const modHint=wsModClickLinkHint();
-      // Each shortcut group uses `&nbsp;` between keys so it never wraps mid-group (e.g. `Esc`
-      // breaking off `↑↓ ⏎`). Separators are their own spans so breaks can happen only between
-      // groups. The footer is `flex-wrap: wrap` so the hint flows cleanly to a second line on
-      // narrow panel widths. Non-breaking inside groups: thin-space-free, using `\u00A0`.
       const groups=[
         '↑↓\u00A0results',
         '⏎\u00A0open',
@@ -3358,6 +3403,27 @@
       ];
       const hint=groups.map(g=>`<span class="ws-hint-group">${g}</span>`).join('<span class="ws-hint-sep">·</span>');
       footer.innerHTML=`<span class="ws-result-count"></span><span class="ws-hint">${hint}</span>`;
+      const batchBar=document.createElement('div');
+      batchBar.className='ws-batch-delete-bar';
+      batchBar.style.display='none';
+      batchBar.innerHTML=`
+        <span class="ws-delete-count">0 records selected</span>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <button type="button" class="ws-btn ws-btn-secondary ws-delete-cancel">Cancel</button>
+          <button type="button" class="ws-btn ws-btn-primary ws-delete-confirm" style="background:rgba(244,67,54,0.9);">Delete</button>
+        </div>
+      `;
+      batchBar.querySelector('.ws-delete-cancel')?.addEventListener('click',()=>{
+        this._selectedForDelete.clear();
+        this._batchMode=false;
+        this._root?.querySelector('.ws-batch-btn')?.classList.remove('ws-active');
+        this._renderResults();
+        this._updateBatchModeUI();
+      });
+      batchBar.querySelector('.ws-delete-confirm')?.addEventListener('click',()=>{
+        void this._confirmAndDeleteSelected();
+      });
+      footer.appendChild(batchBar);
       return footer;
     }
 
@@ -3587,6 +3653,61 @@
 
     _openScopePicker() { SearchPanelScope.open(this); }
     _closeScopePicker() { SearchPanelScope.close(this); }
+
+    _toggleBatchMode() {
+      this._batchMode=!this._batchMode;
+      this._selectedForDelete.clear();
+      this._root?.querySelector('.ws-batch-btn')?.classList.toggle('ws-active',this._batchMode);
+      this._renderResults();
+      this._updateBatchModeUI();
+    }
+
+    _updateBatchModeUI() {
+      const deleteBar=this._root?.querySelector('.ws-batch-delete-bar');
+      if (!deleteBar) return;
+      const count=this._selectedForDelete.size;
+      if (count===0) { deleteBar.style.display='none'; return; }
+      deleteBar.style.display='flex';
+      const countSpan=deleteBar.querySelector('.ws-delete-count');
+      if (countSpan) countSpan.textContent=`${count} record${count!==1?'s':''} selected`;
+    }
+
+    async _confirmAndDeleteSelected() {
+      if (this._selectedForDelete.size===0) return;
+      const count=this._selectedForDelete.size;
+      const msg=`Delete ${count} record${count!==1?'s':''}? This moves them to trash.`;
+      let confirmed=false;
+      try {
+        if (typeof this._h().ui?.showConfirmation==='function') {
+          confirmed=await this._h().ui.showConfirmation({ title:'Confirm Deletion', message:msg, confirmLabel:'Delete', cancelLabel:'Cancel', destructive:true });
+        } else { confirmed=window.confirm(msg); }
+      } catch(e) { confirmed=window.confirm(msg); }
+      if (!confirmed) return;
+      const guidsToDelete=[...this._selectedForDelete];
+      this._selectedForDelete.clear();
+      let successCount=0;
+      for (const guid of guidsToDelete) {
+        try {
+          const record=this._h().data.getRecord(guid);
+          if (record&&typeof record.trash==='function') { await record.trash(); successCount++; }
+        } catch(e) { console.warn('[WorkflowSearch] Failed to trash record',guid,e); }
+      }
+      if (successCount>0) {
+        try { this._h().ui.addToaster({ title:`Deleted ${successCount} record${successCount!==1?'s':''}`, dismissible:false, autoDestroyTime:2000 }); } catch(e) {}
+      }
+      for (const guid of guidsToDelete) {
+        this._h()._index.remove(guid);
+      }
+      this._batchMode=false;
+      this._root?.querySelector('.ws-batch-btn')?.classList.remove('ws-active');
+      if (this._query) {
+        this._search(this._query);
+      } else {
+        this._nameResults=[]; this._bodyResults=[]; this._allResults=[]; this._selectedIdx=-1;
+        this._renderEmptyState(); this._updateFooter(null);
+      }
+      this._updateBatchModeUI();
+    }
   }
 
   /** Load all collections + records needed for people + main index (null on failure). */
